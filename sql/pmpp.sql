@@ -1,35 +1,18 @@
+\echo Use "create extension pmpp;" to load this file. \quit
+
 set client_min_messages = warning;
 
 create temporary table uname_command_output(uname text);
 create temporary table cpu_command_output(num_cpus integer);
 
-do $$
-declare
-    l_uname text;
-    l_num_cpus integer;
-begin
-    copy uname_command_output from program 'uname';
-    select uname into l_uname from uname_command_output;
-    if l_uname = 'Linux' then
-        copy cpu_command_output from program 'nproc';
-    elsif l_name = 'Darwin' then
-        copy cpu_command_output from program 'sysctl hw.ncpu | awk ''{print $2}''';
-    else
-        raise exception 'Unkown uname result: %', l_uname;
-    end if;
-    -- Windows: ???
-    select num_cpus into l_num_cpus from cpu_command_output;
-    execute format('create function num_cpus() returns integer language sql immutable as %L',
-                    format('select %s;',l_num_cpus));
-end;
-$$;
-
-drop table uname_command_output;
-drop table cpu_command_output;
+create function num_cpus() returns integer
+as 'MODULE_PATHNAME','pmpp_num_cpus'
+language c immutable strict;
 
 comment on function num_cpus()
 is 'The number of cpus detected on this database machine';
 
+/* TODO DELETE
 create function num_cpus(multiplier in float) returns integer
 language sql immutable set search_path from current as $$
 select greatest(1,(multiplier * num_cpus()::float)::integer);
@@ -38,7 +21,9 @@ $$;
 comment on function num_cpus(multiplier float)
 is E'The number of cpus on this machine times a given multiplier.\n'
     'Never return a number below 1.';
+*/
 
+/* TODO DELETE
 create function num_cpus_remote(connection_string text, cpu_multiplier float default 1.0) returns integer
 language sql security definer set search_path from current as $$
 select  r.num_cpus
@@ -47,7 +32,9 @@ $$;
 
 comment on function num_cpus_remote(connection_string text, cpu_multiplier float) 
 is  'Get the number of cpus from a remote machine, assuming the machine has pmpp intalled';
+*/
 
+/* TODO DELETE
 create function disconnect() returns setof text language sql security definer
 set search_path from current as $$
 select  dblink_cancel_query(r.s)
@@ -61,6 +48,7 @@ $$;
 
 comment on function disconnect()
 is  'Disconnect from all @extschema@.* connections';
+*/
 
 create function jsonb_array_to_text_array(jsonb_arr jsonb) returns text[]
 language sql as $$
@@ -136,6 +124,13 @@ comment on function manifest_array( query_manifest jsonb )
 is E'Decompose a query manifest jsonb into an array suitable for distribute().\n'
     'This is exposed largely for debugging purposes.';
 
+create function distribute( row_type anyelement,
+                            query_manifest query_manifest[] )
+                            returns setof anyelement
+as 'MODULE_PATHNAME','pmpp_distribute'
+language c;
+
+/*
 create function distribute( row_type anyelement,
                             query_manifest query_manifest[] )
                             returns setof anyelement
@@ -360,6 +355,7 @@ exception
         raise;
 end;
 $$;
+*/
 
 comment on function distribute(anyelement,query_manifest[])
 is E'For each query manifest object in the array:\n'
@@ -399,10 +395,11 @@ $$;
 comment on function distribute(anyelement,json)
 is 'Pass-through function so that we can accept json as well as jsonb';
 
+/* TODO this changed */
 create function distribute( row_type anyelement,
                             connection text,
                             sql_list text[],
-                            cpu_multiplier float default 1.0,
+                            cpu_multiplier float default null, 
                             num_workers integer default null,
                             statement_timeout integer default null)
                             returns setof anyelement

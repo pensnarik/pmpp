@@ -10,6 +10,12 @@ create schema dblink_test_schema;
 create extension dblink schema dblink_test_schema;
 create extension postgres_fdw; -- a user-mappings convenience, not a dependency
 create extension pmpp;
+select sign(pmpp.num_cpus());
+ sign 
+------
+    1
+(1 row)
+
 select  current_database() as dbname,
         'dbname=' || current_database() as loopback_su_conn_str
 \gset 
