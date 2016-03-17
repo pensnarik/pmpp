@@ -10,8 +10,6 @@ grant pmpp to :pmpp_test_user, :nopw_test_user;
 create extension postgres_fdw; -- a user-mappings convenience, not a dependency
 create extension pmpp;
 
-select typtypmod from pg_type where typname = 'query_manifest';
-
 select sign(pmpp.num_cpus());
 
 select  current_database() as dbname,
@@ -31,7 +29,6 @@ select  format('[{"connection": "%s", "query": "select 1"}]',
 \gset 
 
 select pmpp.to_query_manifest('{"connection": "foo"}'::jsonb);
-
 
 select  *
 from    pmpp.execute_command('analyze');

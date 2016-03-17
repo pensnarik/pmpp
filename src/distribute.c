@@ -545,8 +545,15 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 							 */
 							while ((result = PQgetResult(cur_worker->connection)) != NULL)
 							{
-								int nfields = PQnfields(result);
-								int ntuples = PQntuples(result);
+								int nfields;
+								int ntuples;
+
+								if (PQresultStatus(result) != PGRES_TUPLES_OK)
+								{
+									res_error(result,cur_worker->connstr,cur_worker->current_query,true);
+								}
+								nfields = PQnfields(result);
+								ntuples = PQntuples(result);
 								if (nfields != outrs_tupdesc->natts)
 								{
 									ereport(ERROR,
@@ -554,7 +561,6 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 											 errmsg("result rowtype does not match expected rowtype connection: %s query: %s",
 													cur_worker->connstr, cur_worker->current_query)));
 								}
-								/* TODO don't we want to check types too? */
 								
 								if (ntuples > 0)
 								{
