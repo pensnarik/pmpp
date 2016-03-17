@@ -13,3 +13,17 @@ create or replace function distribute(  row_type anyelement,
 as 'MODULE_PATHNAME','distribute'
 language c;
 
+-- added default null on cpu_multiplier
+create or replace function distribute( row_type anyelement,
+                            connection text,
+                            sql_list text[],
+                            cpu_multiplier float default null, 
+                            num_workers integer default null,
+                            statement_timeout integer default null)
+                            returns setof anyelement
+language sql security definer set search_path from current 
+as $$
+select  distribute(row_type,
+                    array[ row(connection,sql_list,cpu_multiplier,num_workers,statement_timeout)::query_manifest ]);
+$$;
+
