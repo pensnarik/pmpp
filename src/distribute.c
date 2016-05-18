@@ -545,51 +545,72 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 							 */
 							while ((result = PQgetResult(cur_worker->connection)) != NULL)
 							{
-								int nfields;
-								int ntuples;
+								if (PQresultStatus(result) == PGRES_TUPLES_OK)
+								{
+									int nfields;
+									int ntuples;
 
-								if (PQresultStatus(result) != PGRES_TUPLES_OK)
+									nfields = PQnfields(result);
+									ntuples = PQntuples(result);
+									if (nfields != outrs_tupdesc->natts)
+									{
+										ereport(ERROR,
+												(errcode(ERRCODE_DATATYPE_MISMATCH),
+												 errmsg("result rowtype does not match expected rowtype connection: %s query: %s",
+														cur_worker->connstr, cur_worker->current_query)));
+									}
+									
+									if (ntuples > 0)
+									{
+										char	  **values = (char **) palloc(nfields * sizeof(char *));
+										int			row;
+
+										/* put all tuples into the tuplestore */
+										for (row = 0; row < ntuples; row++)
+										{
+											ErrorContextCallback errcallback;
+											HeapTuple	tuple;
+											int			i;
+											for (i = 0; i < nfields; i++)
+											{
+												if (PQgetisnull(result, row, i))
+													values[i] = NULL;
+												else
+													values[i] = PQgetvalue(result, row, i);
+											}
+											errcallback.callback = worker_error_callback;
+											errcallback.arg = (void *) cur_worker;
+											errcallback.previous = error_context_stack;
+											error_context_stack = &errcallback;
+
+											/* build the tuple and put it into the tuplestore. */
+											tuple = BuildTupleFromCStrings(outrs_attinmeta, values);
+											error_context_stack = errcallback.previous;
+											tuplestore_puttuple(outrs_tupstore, tuple);
+										}
+									}
+								}
+								else if (PQresultStatus(result) == PGRES_COMMAND_OK)
+								{
+									/* Non-query commands only return one row (query,status) */
+									ErrorContextCallback errcallback;
+									char	  **values = (char **) palloc(2 * sizeof(char *));
+									HeapTuple	tuple;
+
+									errcallback.callback = worker_error_callback;
+									errcallback.arg = (void *) cur_worker;
+									errcallback.previous = error_context_stack;
+									error_context_stack = &errcallback;
+
+									values[0] = cur_worker->current_query;
+									values[1] = PQcmdStatus(result);
+									tuple = BuildTupleFromCStrings(outrs_attinmeta, values);
+									error_context_stack = errcallback.previous;
+									tuplestore_puttuple(outrs_tupstore, tuple);
+								}
+								else
 								{
 									res_error(result,cur_worker->connstr,cur_worker->current_query,true);
-								}
-								nfields = PQnfields(result);
-								ntuples = PQntuples(result);
-								if (nfields != outrs_tupdesc->natts)
-								{
-									ereport(ERROR,
-											(errcode(ERRCODE_DATATYPE_MISMATCH),
-											 errmsg("result rowtype does not match expected rowtype connection: %s query: %s",
-													cur_worker->connstr, cur_worker->current_query)));
-								}
-								
-								if (ntuples > 0)
-								{
-									char	  **values = (char **) palloc(nfields * sizeof(char *));
-									int			row;
-
-									/* put all tuples into the tuplestore */
-									for (row = 0; row < ntuples; row++)
-									{
-										ErrorContextCallback errcallback;
-										HeapTuple	tuple;
-										int			i;
-										for (i = 0; i < nfields; i++)
-										{
-											if (PQgetisnull(result, row, i))
-												values[i] = NULL;
-											else
-												values[i] = PQgetvalue(result, row, i);
-										}
-										errcallback.callback = worker_error_callback;
-										errcallback.arg = (void *) cur_worker;
-										errcallback.previous = error_context_stack;
-										error_context_stack = &errcallback;
-
-										/* build the tuple and put it into the tuplestore. */
-										tuple = BuildTupleFromCStrings(outrs_attinmeta, values);
-										error_context_stack = errcallback.previous;
-										tuplestore_puttuple(outrs_tupstore, tuple);
-									}
 								}
 								PQclear(result);
 							}

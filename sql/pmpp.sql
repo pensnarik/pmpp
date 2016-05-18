@@ -171,21 +171,6 @@ is E'Simple type for getting the results of non-set-returning-function commands\
     'and the SQL that generated that result';
 
 
--- search path and security must match the connection, not the definer
-create function execute_command(sql text) returns command_with_result
-language plpgsql as $$
-begin
-    -- I would rather we returned the string from PQcmdStatus(PGresult *res), but for now OK/FAIL will have to do
-    execute sql;
-    return (sql,'OK')::@extschema@.command_with_result;
-exception when others then
-    return (sql,'FAIL')::@extschema@.command_with_result;
-end
-$$;
-
-comment on function execute_command(sql text)
-is 'Execute a non-set-returning-function and report the success or failure of it';
-
 create function meta(   connection text,
                         sql_list text[],
                         cpu_multiplier float default null,
@@ -195,8 +180,7 @@ language sql security definer set search_path from current as $$
 select  *
 from    distribute( null::command_with_result,
                     connection,
-                    array(  select  format('select * from "@extschema@".execute_command(%L)',t.sql)
-                            from    unnest(sql_list) as t(sql) ),
+                    sql_list,
                     cpu_multiplier,
                     num_workers,
                     statement_timeout);

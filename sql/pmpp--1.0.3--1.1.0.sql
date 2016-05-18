@@ -27,3 +27,20 @@ select  distribute(row_type,
                     array[ row(connection,sql_list,cpu_multiplier,num_workers,statement_timeout)::query_manifest ]);
 $$;
 
+create or replace function meta(   connection text,
+                        sql_list text[],
+                        cpu_multiplier float default null,
+                        num_workers integer default null,
+                        statement_timeout integer default null) returns setof command_with_result
+language sql security definer set search_path from current as $$
+select  *
+from    distribute( null::command_with_result,
+                    connection,
+                    sql_list,
+                    cpu_multiplier,
+                    num_workers,
+                    statement_timeout);
+$$;
+
+drop function execute_command(sql text);
+

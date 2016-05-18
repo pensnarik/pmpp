@@ -1,6 +1,6 @@
-
-
-\echo roles must exist on both sides of the connection so they cannot be created in a transaction
+--
+-- roles must exist on both sides of the connection so they cannot be created in a transaction
+--
 \set pmpp_test_user 'pmpp_test_user'
 \set password 'dummy';
 \set nopw_test_user 'nopw_test_user'
@@ -30,9 +30,6 @@ select  format('[{"connection": "%s", "query": "select 1"}]',
 
 select pmpp.to_query_manifest('{"connection": "foo"}'::jsonb);
 
-select  *
-from    pmpp.execute_command('analyze');
-
 create table parallel_index_test( b integer, c integer, d integer );
 grant all on parallel_index_test to public;
 
@@ -49,12 +46,9 @@ from    parallel_index_test
 group by b
 order by b;
 
-select * from pmpp.execute_command('create index pit1 on parallel_index_test(c)');
-select * from pmpp.execute_command('drop index pit1');
-
-
-----
+--
 -- test cast of array which tests cast of pmpp.query_manifest as well
+--
 select  t.*
 from    unnest(:'json_str_1'::jsonb::pmpp.query_manifest[]) t;
 
@@ -83,6 +77,9 @@ from    pmpp.manifest_set(:'json_str_1'::jsonb) as t;
 select *
 from    pmpp.distribute(null::x, :'json_str_1'::jsonb);
 
+--
+-- test meta() which is just distribute() with a specific result set
+--
 select  *
 from    pmpp.meta('dbname=' || current_database(), 
                     array(  select format('create index on %s(%s)',c.table_name,c.column_name)
@@ -110,14 +107,37 @@ options (host 'localhost', dbname :'dbname' );
 
 create user mapping for public server :pmpp_localhost_server options(user :'pmpp_test_user', password :'password');
 
+--
+-- test normal legit queryset
+--
 select *
 from    pmpp.distribute(null::x,:'pmpp_localhost_server',array['select 1','select 2','select 3']);
 
+--
+-- test result set with too many columns
+--
+select *
+from    pmpp.distribute(null::x,:'pmpp_localhost_server',array['select 1','select 2','select 3, 4']);
+
+--
+-- test result set with right number of columns but wrong type
+--
+select *
+from    pmpp.distribute(null::x,:'pmpp_localhost_server',array['select 1','select ''2016-01-01''::date','select 3']);
+
+
+--
+-- test legit json input
+--
 select *
 from    pmpp.distribute(null::x, :'json_str_2'::jsonb);
 
+--
+-- test a query that times out
+--
 select *
 from    pmpp.distribute(null::x, :'json_str_timeout'::jsonb);
+
 
 select *
 from pmpp.broadcast(null::x, array[ :'loopback_su_conn_str' , :'pmpp_localhost_server' ], 'select 1');
@@ -135,14 +155,6 @@ from    pmpp.distribute(null::x, :'json_str_2'::jsonb);
 select *
 from    pmpp.distribute(null::x, '[{"connection": "bad_connstr_1", "query": "select 1"},'
                                  '{"connection": "bad_connstr2", "query": "select 2"}]'::jsonb); 
-
--- test result set with too many columns
-select *
-from    pmpp.distribute(null::x,:'pmpp_localhost_server',array['select 1','select 2','select 3, 4']);
-
--- test result set with right number of columns but wrong type
-select *
-from    pmpp.distribute(null::x,:'pmpp_localhost_server',array['select 1','select ''2016-01-01''::date','select 3']);
 
 drop role :pmpp_test_user;
 drop role :nopw_test_user;

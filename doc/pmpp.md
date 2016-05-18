@@ -269,7 +269,7 @@ function meta(
             statement_timeout integer default null) returns setof command_with_result
 ```
 
-Each statement in `sql_list` is wrapped in a `SELECT pmpp.execute_command(<statement>)`, which returns a type `command_with_result` which looks like this: 
+The result set is of the type `command_with_result`, which looks like this:
 
 ```sql
 type command_with_result ( command text, result text );
@@ -328,26 +328,6 @@ FROM pmpp.broadcast(null::x,
 
 
 ### Other functions
-
-#### execute_command
-
-```sql
-function execute_command(sql text) RETURNS command_with_result
-```
-
-Executes the command `sql` and returns that string along with a returncode of `'OK'` or `'FAIL'`. 
-
-This function is used inside `meta()`. It is not particularly useful on its own.
-
-##### Example:
-
-```
-SELECT * from pmpp.execute_command('analyze');
- command | result
----------+--------
- analyze | OK
-(1 row)
-```
 
 ### Internal functions of no direct utility to the user
 
