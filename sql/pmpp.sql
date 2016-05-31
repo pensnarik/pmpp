@@ -27,7 +27,7 @@ create type query_manifest as (
     queries text[],
     cpu_multiplier float,
     num_workers integer,
-    statement_timeout integer
+    setup_commands text[]
 );
 
 comment on type query_manifest
@@ -41,11 +41,17 @@ select  item->>'connection' as connection,
         array_remove(jsonb_array_to_text_array(item->'queries') || (item->>'query'),null) as queries,
         (item->>'cpu_multiplier')::float as cpu_multiplier,
         (item->>'num_workers')::integer as num_workers,
-        (item->>'statement_timeout')::integer as statement_timeout;
+        case
+            when item->>'statement_timeout' is null then
+                jsonb_array_to_text_array(item->'setup_commands')
+            else
+                jsonb_array_to_text_array(item->'setup_commands') || concat('set statement_timeout = ',item->>'statement_timeout')
+        end as setup_commands;
 $$;
 
 comment on function to_query_manifest(item in jsonb)
-is  'Convert a JSONB manifest item to a query_manifest';
+is  'Convert a JSONB manifest item to a query_manifest.\n'
+    'This includes support for mapping statement_timeout into the setup_commands array';
 
 create cast (jsonb as query_manifest) with function to_query_manifest(jsonb) as implicit;
 
@@ -135,15 +141,15 @@ create function distribute( row_type anyelement,
                             sql_list text[],
                             cpu_multiplier float default null, 
                             num_workers integer default null,
-                            statement_timeout integer default null)
+                            setup_commands text[] default null)
                             returns setof anyelement
 language sql security definer set search_path from current 
 as $$
 select  distribute(row_type,
-                    array[ row(connection,sql_list,cpu_multiplier,num_workers,statement_timeout)::query_manifest ]);
+                    array[ row(connection,sql_list,cpu_multiplier,num_workers,setup_commands)::query_manifest ]);
 $$;
 
-comment on function distribute(anyelement,text,text[],float,integer,integer)
+comment on function distribute(anyelement,text,text[],float,integer,text[])
 is E'Given an array of sql commands, execute each one against an async conneciton specified,\n'
     'spawning as many connections as specified by the multiplier of the number of cpus on the machine,\n'
     'returning a set of data specified by the row type.\n'
@@ -175,7 +181,7 @@ create function meta(   connection text,
                         sql_list text[],
                         cpu_multiplier float default null,
                         num_workers integer default null,
-                        statement_timeout integer default null) returns setof command_with_result
+                        setup_commands text[] default null) returns setof command_with_result
 language sql security definer set search_path from current as $$
 select  *
 from    distribute( null::command_with_result,
@@ -183,10 +189,10 @@ from    distribute( null::command_with_result,
                     sql_list,
                     cpu_multiplier,
                     num_workers,
-                    statement_timeout);
+                    setup_commands);
 $$;
 
-comment on function meta(text,text[],float,integer,integer)
+comment on function meta(text,text[],float,integer,text[])
 is E'Convenience routine for executing non-SELECT statements in parallel.\n'
     'Example:\n'
     'SELECT *\n'
@@ -217,5 +223,4 @@ is E'Execute a single SQL query across a list of connections\n'
 
 grant usage on schema @extschema@ to pmpp;
 grant execute on all functions in schema @extschema@ to pmpp;
-
 

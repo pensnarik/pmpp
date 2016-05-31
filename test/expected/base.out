@@ -79,9 +79,9 @@ order by b;
 --
 select  t.*
 from    unnest(:'json_str_1'::jsonb::pmpp.query_manifest[]) t;
-        connection         |   queries    | cpu_multiplier | num_workers | statement_timeout 
----------------------------+--------------+----------------+-------------+-------------------
- dbname=contrib_regression | {"select 1"} |                |             |                  
+        connection         |   queries    | cpu_multiplier | num_workers | setup_commands 
+---------------------------+--------------+----------------+-------------+----------------
+ dbname=contrib_regression | {"select 1"} |                |             | 
 (1 row)
 
 create temporary table x(y integer);
@@ -97,9 +97,9 @@ order by y;
 
 select  *
 from    pmpp.manifest_set(:'json_str_1'::jsonb);
-        connection         |   queries    | cpu_multiplier | num_workers | statement_timeout 
----------------------------+--------------+----------------+-------------+-------------------
- dbname=contrib_regression | {"select 1"} |                |             |                  
+        connection         |   queries    | cpu_multiplier | num_workers | setup_commands 
+---------------------------+--------------+----------------+-------------+----------------
+ dbname=contrib_regression | {"select 1"} |                |             | 
 (1 row)
 
 select  queries
@@ -111,16 +111,16 @@ from    pmpp.manifest_set(:'json_str_1'::jsonb);
 
 select  *
 from    pmpp.manifest_set(:'json_str_div_zero'::jsonb);
-    connection    |               queries                | cpu_multiplier | num_workers | statement_timeout 
-------------------+--------------------------------------+----------------+-------------+-------------------
- localhost_server | {"select 1","select 2/0","select 3"} |                |           1 |                  
+    connection    |               queries                | cpu_multiplier | num_workers | setup_commands 
+------------------+--------------------------------------+----------------+-------------+----------------
+ localhost_server | {"select 1","select 2/0","select 3"} |                |           1 | 
 (1 row)
 
 select  *
 from    pmpp.manifest_set(:'json_str_timeout'::jsonb);
-    connection    |            queries            | cpu_multiplier | num_workers | statement_timeout 
-------------------+-------------------------------+----------------+-------------+-------------------
- localhost_server | {"select count(pg_sleep(1))"} |                |             |               100
+    connection    |            queries            | cpu_multiplier | num_workers |         setup_commands          
+------------------+-------------------------------+----------------+-------------+---------------------------------
+ localhost_server | {"select count(pg_sleep(1))"} |                |             | {"set statement_timeout = 100"}
 (1 row)
 
 create temporary table r as
@@ -141,7 +141,8 @@ from    pmpp.meta('dbname=' || current_database(),
                     array(  select format('create index on %s(%s)',c.table_name,c.column_name)
                             from    information_schema.columns c
                             where   c.table_name = 'parallel_index_test'
-                            and     c.table_schema = 'public'))
+                            and     c.table_schema = 'public'),
+                    setup_commands := array ['set application_name = indexer','set client_encoding = UTF8'])
 order by 1;
                 command                 |    result    
 ----------------------------------------+--------------
@@ -254,7 +255,8 @@ DETAIL:  fe_sendauth: no password supplied
 CONTEXT:  SQL function "distribute" statement 1
 select *
 from    pmpp.distribute(null::x, '[{"connection": "bad_connstr_1", "query": "select 1"},'
-                                 '{"connection": "bad_connstr2", "query": "select 2"}]'::jsonb); 
+                                 '{"connection": "bad_connstr2", "query": "select 2", '
+                                 '  "setup_commands": ["set application_name = test1", "set client_encoding = UTF8" ] }]'::jsonb); 
 ERROR:  could not establish connection
 DETAIL:  missing "=" after "bad_connstr_1" in connection info string
 

@@ -23,7 +23,7 @@
 #define QUERY_MANIFEST_QUERIES_ATTR_INDEX 1
 #define QUERY_MANIFEST_CPU_MULTIPLIER_ATTR_INDEX 2
 #define QUERY_MANIFEST_NUM_WORKERS_ATTR_INDEX 3
-#define QUERY_MANIFEST_STATEMENT_TIMEOUT_ATTR_INDEX 4
+#define QUERY_MANIFEST_SETUP_COMMANDS_ATTR_INDEX 4
 
 
 #ifdef PG_MODULE_MAGIC
@@ -37,15 +37,48 @@ typedef struct {
 	char	*current_query;
 } worker;
 
+/*
+	query_manifest
+	--------------
+
+	num_workers:
+		The number of elements in the workers array.
+	num_queries:
+		The number of elements in the queries array.
+	num_setup_commands:
+		The number of elements in the setup_commands array.
+	next_query:
+		Index of the first un-executed query in the queries array.
+	cpu_multiplier:
+		If the remote system can reveal how many CPUs it has, that number is multiplied by cpu_multiplier
+		to give the number of connections to create. The number of connections created will not be below 1
+		and will not exceed the number of elements in the queries array.
+	connection_string:
+		The connection string given to us by the user, the one that should be used in error messages
+	resolved_connection_string:
+		The actual string to be sent to libpq. This will be the same value as connection_string except in cases
+		where connection_string references a foreign server. In that case, it is the string derived from the
+		foreign server and user mapping.
+	workers:
+		The worker processes that will run the queries given.
+	queries:
+		All of the queries to be sent to the worker(s) that will use this connection string.
+	setup_commands:
+		A list of commands (set application_name = ..., set session_timeout = ..., etc) that must be executed
+		by each connection prior to executing any queries in the queries attribute.
+*/
+ 
 typedef struct {
 	int		num_workers;
-	int		statement_timeout;
 	int		num_queries;
+	int		num_setup_commands;
 	int		next_query;
 	float	cpu_multiplier;
 	char	*connection_string;
+	char	*resolved_connection_string;
 	worker	*workers;
 	char	**queries;
+	char	**setup_commands;
 } query_manifest;
 
 /*
@@ -195,16 +228,15 @@ res_error(PGresult *res, const char *connstr, const char *querystr, bool fail)
 }
 
 /*
- * make a connection to a remote(?) database, and set the statement_timeout, if any
+ * make a connection to a remote(?) database, and run the setup_commands, if any
  */
 static PGconn*
-make_async_connection(const char* connstr, int timeout)
+make_async_connection(query_manifest* m)
 {
-	char	*resolved_connstr;
 	PGconn	*conn;
-	/* if the connection string was actually a foreign server name, use the credentials from that instead */
-	resolved_connstr = get_connect_string(connstr);
-	conn = PQconnectdb( (resolved_connstr != NULL) ? resolved_connstr : connstr );
+	int		i;
+
+	conn = PQconnectdb( m->resolved_connection_string );
 
 	if (PQstatus(conn) == CONNECTION_BAD)
 	{
@@ -221,13 +253,12 @@ make_async_connection(const char* connstr, int timeout)
 		PQsetClientEncoding(conn, GetDatabaseEncodingName());
 	}
 
-	if (timeout > 0)
+	for ( i = 0; i < m->num_setup_commands; i++ ) 
 	{
-		char		*set_timeout_query = psprintf("set statement_timeout = %d",timeout);
-		PGresult	*result = PQexec(conn,set_timeout_query);
+		PGresult	*result = PQexec(conn,m->setup_commands[i]);
 		if (PQresultStatus(result) != PGRES_COMMAND_OK)
 		{
-			res_error(result,connstr,set_timeout_query,true);
+			res_error(result,m->connection_string,m->setup_commands[i],true);
 		}
 		PQclear(result);
 	}
@@ -376,6 +407,13 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 			Datum		*queries_datum_list;
 			int			queries_num_datums;
 			int			q;
+			ArrayType	*setups_array;
+			Oid			setups_oid;
+			int16		setups_element_length;
+			bool		setups_element_pass_by_value;
+			char		setups_element_align;
+			Datum		*setups_datum_list;
+			int			setups_num_datums;
 
 			PGconn		*first_connection;
 			worker		*cur_worker;
@@ -398,14 +436,18 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 			}
 			m->connection_string = text_to_cstring(DatumGetTextP(query_manifest_t_attr_datums[QUERY_MANIFEST_CONNECTION_ATTR_INDEX]));
 
+			/* if the connection string was actually a foreign server name, use the credentials from that instead */
+			m->resolved_connection_string = get_connect_string(m->connection_string);
+			if (m->resolved_connection_string == NULL)
+			{
+				m->resolved_connection_string = m->connection_string;
+			}
+
 			m->cpu_multiplier = (query_manifest_t_attr_nulls[QUERY_MANIFEST_CPU_MULTIPLIER_ATTR_INDEX]) ?  (float) 1.0 :
 				DatumGetFloat4(query_manifest_t_attr_datums[QUERY_MANIFEST_CPU_MULTIPLIER_ATTR_INDEX]);
 
 			m->num_workers = (query_manifest_t_attr_nulls[QUERY_MANIFEST_NUM_WORKERS_ATTR_INDEX]) ? -1 :
 				DatumGetInt32(query_manifest_t_attr_datums[QUERY_MANIFEST_NUM_WORKERS_ATTR_INDEX]);
-
-			m->statement_timeout = (query_manifest_t_attr_nulls[QUERY_MANIFEST_STATEMENT_TIMEOUT_ATTR_INDEX]) ? 0 :
-				DatumGetInt32(query_manifest_t_attr_datums[QUERY_MANIFEST_STATEMENT_TIMEOUT_ATTR_INDEX]);
 
 			if (query_manifest_t_attr_nulls[QUERY_MANIFEST_QUERIES_ATTR_INDEX])
 			{
@@ -449,7 +491,47 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 
 			m->num_queries = queries_num_datums;
 
-			first_connection = make_async_connection(m->connection_string,m->statement_timeout);
+			if (query_manifest_t_attr_nulls[QUERY_MANIFEST_SETUP_COMMANDS_ATTR_INDEX])
+			{
+				m->num_setup_commands = 0;
+			}
+			else
+			{
+				setups_array = DatumGetArrayTypeP(query_manifest_t_attr_datums[QUERY_MANIFEST_SETUP_COMMANDS_ATTR_INDEX]);
+				/* setups_array must contain no nulls */
+				if (array_contains_nulls(setups_array))
+				{
+					ereport(ERROR,
+									(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+									 errmsg("setup_commands array must not contain nulls")));
+				}
+				/* extract queries type info from dictionary */
+				setups_oid = ARR_ELEMTYPE(setups_array);
+				get_typlenbyvalalign(	setups_oid,
+										&setups_element_length,
+										&setups_element_pass_by_value,
+										&setups_element_align);
+
+				/* translate setups_array into list of Datums setups_datum_list */
+				deconstruct_array(	setups_array,
+									setups_oid,
+									setups_element_length,
+									setups_element_pass_by_value,
+									setups_element_align,
+									&setups_datum_list,
+									NULL,
+									&setups_num_datums);
+				m->setup_commands = (char**) palloc0( sizeof(char*) * setups_num_datums );
+				for (q = 0; q < setups_num_datums; q++)
+				{
+					text	*setup_text = DatumGetTextP(setups_datum_list[q]);
+					m->setup_commands[q] = text_to_cstring(setup_text);
+				}
+
+				m->num_setup_commands = setups_num_datums;
+			}
+
+			first_connection = make_async_connection(m);
 
 			/* in cases where num_workers wasn't explicit, we must either ask or infer the number */
 			if ( m->num_workers == -1 )
@@ -500,7 +582,7 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 					break;
 				}
 				cur_worker++;
-				cur_worker->connection = make_async_connection(m->connection_string,m->statement_timeout);
+				cur_worker->connection = make_async_connection(m);
 			} 
 		}
 		ReleaseTupleDesc(query_manifest_t_tupdesc);

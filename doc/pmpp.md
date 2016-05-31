@@ -117,7 +117,7 @@ function distribute(
             sql_list text[],
             cpu_multiplier float default 1.0,
             num_workers integer default null,
-            statement_timeout integer default null) returns setof anyelement
+            setup_commands text[] default null) returns setof anyelement
 ```
 
 This is the simplest form of the `distribute()` function, geared more towards local parallelism rather than sharding.
@@ -129,7 +129,7 @@ This is the simplest form of the `distribute()` function, geared more towards lo
 * **sql_list**: an array of text, each element being a valid SQL SELECT statement. The statements must reference objects found on the connection `connection`. The result set generated needs to be coercable into `row_type`, though it should be noted that only column order and (approximate, coercable) type matter, column names do not matter. 
 * **cpu_multiplier** (often omitted, defaults to 1.0): Specifies the number of connections to make to `connection` relative to the number of CPUs found on that machine, but never less than one or more than the number of array elements in `queries`. A value of 2.0 means to make two connections per CPU, 0.25 means one connection per four CPUs, etc. This value is trumped by `num_workers`. If this value is specified (and `num_workers` is not) then the connection `connection` *must* have PMPP installed.
 * **num_workers** (often omitted/null): If set, specifies the max number of connections to `connection` to make. PMPP will never make more connections than there are queries to run for that `connection`. Specifying this value overrides any value in `cpu_multiplier`. This value is requires if the database at `connection` does not have PMPP installed.
-* **statement_timeout** (often omitted/null): If set, each connection to `connection` has `SET statement_timeout=<value>` executed after the connection is established.
+* **setup_commands** (often omitted/null): If set, each connection to `connection` will execute each of the statements, in the order given, after the connection is established and before executing any the queries in `sql_list`. Any errors caused by these statements will cause the overall statement to itself fail. The results of these statements will not be returned through the function, so the only obvious uses are commands such at `set application_name = ...` and `set client_encoding = ...`.
 
 The number of connections created is never less than one, and never more than the number of queries in `sql_list`. When a query completes, its results are passed along to the output result set, and the function will give the connection another query, if any remain. When no more queries are available for distribution, the connection will be disconnected. When all connections have disconnected, the function returns the combined result set.
 
@@ -166,7 +166,7 @@ type query_manifest as (
          queries text[], 
          num_workers integer, 
          cpu_multiplier float, 
-         statement_timeout integer );
+         setup_commands text[] );
 ```
 
 Each of these attributes exactly matches the purpose described by the same-named parameters in the single database version of `distribute()`.
@@ -266,7 +266,7 @@ function meta(
             sql_list text[],
             cpu_multiplier float default null,
             num_workers integer default null,
-            statement_timeout integer default null) returns setof command_with_result
+            setup_commands text[] default null) returns setof command_with_result
 ```
 
 The result set is of the type `command_with_result`, which looks like this:

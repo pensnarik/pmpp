@@ -85,7 +85,8 @@ from    pmpp.meta('dbname=' || current_database(),
                     array(  select format('create index on %s(%s)',c.table_name,c.column_name)
                             from    information_schema.columns c
                             where   c.table_name = 'parallel_index_test'
-                            and     c.table_schema = 'public'))
+                            and     c.table_schema = 'public'),
+                    setup_commands := array ['set application_name = indexer','set client_encoding = UTF8'])
 order by 1;
 
 \d+ parallel_index_test
@@ -154,7 +155,8 @@ from    pmpp.distribute(null::x, :'json_str_2'::jsonb);
 
 select *
 from    pmpp.distribute(null::x, '[{"connection": "bad_connstr_1", "query": "select 1"},'
-                                 '{"connection": "bad_connstr2", "query": "select 2"}]'::jsonb); 
+                                 '{"connection": "bad_connstr2", "query": "select 2", '
+                                 '  "setup_commands": ["set application_name = test1", "set client_encoding = UTF8" ] }]'::jsonb); 
 
 drop role :pmpp_test_user;
 drop role :nopw_test_user;
