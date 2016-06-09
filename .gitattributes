@@ -1,0 +1,2 @@
+# borrowed from postgres github repo
+*.[chly]	whitespace=space-before-tab,trailing-space,indent-with-non-tab,tabwidth=4
