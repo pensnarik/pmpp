@@ -25,10 +25,13 @@
 #define QUERY_MANIFEST_NUM_WORKERS_ATTR_INDEX 3
 #define QUERY_MANIFEST_SETUP_COMMANDS_ATTR_INDEX 4
 
+#define ARRAY_OK 0
+#define ARRAY_CONTAINS_NULLS 1
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
 #endif
+
 
 
 typedef struct {
@@ -296,6 +299,49 @@ num_remote_cpus(PGconn *conn, char *connstr, float cpu_multiplier)
 	return num_remote_cpus;
 }
 
+/*
+ * unpack a datum that happens to be text[]
+ */
+static int
+unpack_datum_to_cstring_array(Datum datum, char ***cstring_array, int *array_length)
+{
+	ArrayType	*array = DatumGetArrayTypeP(datum);
+	Oid			oid = ARR_ELEMTYPE(array);
+	int16		element_length;
+	bool		element_pass_by_value;
+	char		element_align;
+
+	Datum		*datum_list;
+	int			i;
+
+	if (array_contains_nulls(array))
+	{
+		return ARRAY_CONTAINS_NULLS;
+	}
+
+	get_typlenbyvalalign(oid, &element_length, &element_pass_by_value, &element_align);
+
+	/* translate array into list of Datums datum_list */
+	deconstruct_array(	array,
+						oid,
+						element_length,
+						element_pass_by_value,
+						element_align,
+						&datum_list,
+						NULL,
+						array_length);
+
+	/* convert the list of datums into an array of c strings */
+	*cstring_array = (char**) palloc0( sizeof(char*) * (*array_length) );
+
+	for (i = 0; i < (*array_length); i++)
+	{
+		text *t = DatumGetTextP(datum_list[i]);
+		(*cstring_array)[i] = text_to_cstring(t);
+	}
+	return ARRAY_OK;
+}
+
 
 
 /*
@@ -314,10 +360,10 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 	MemoryContext	oldcontext;
 
 	/*
-     * 1st Arg is row_type, it is needed only for polymorphism, so we can ignore that
+	 * 1st Arg is row_type, it is needed only for polymorphism, so we can ignore that
 	 * 2nd Arg is the query_manifest, and must be of type query_manifest_t
-     *
-     */
+	 */
+
 	ArrayType	*query_manifest_t_param = PG_GETARG_ARRAYTYPE_P(1);
 	Oid			query_manifest_t_param_oid = ARR_ELEMTYPE(query_manifest_t_param);
 	int16		query_manifest_t_param_element_length;
@@ -326,6 +372,7 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 	Datum		*query_manifest_t_datum_list;
 	int			query_manifest_t_num_datums;
 	int			i;
+
 
 	TupleDesc   query_manifest_t_tupdesc = lookup_rowtype_tupdesc(query_manifest_t_param_oid,-1);
 	Datum		*query_manifest_t_attr_datums = (Datum *) palloc(query_manifest_t_tupdesc->natts * sizeof(Datum));
@@ -369,7 +416,7 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 	{
 		ereport(ERROR,
 						(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-						 errmsg("array must not contain nulls")));
+						 errmsg("query_manifet array must not contain nulls")));
 	}
 
 	/* extract query_manifest_t type info from dictionary */
@@ -398,23 +445,6 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 		{
 			HeapTupleHeader tuple_header = DatumGetHeapTupleHeader(query_manifest_t_datum_list[i]);
 			HeapTupleData tuple_data;
-
-			ArrayType	*queries_array;
-			Oid			queries_oid;
-			int16		queries_element_length;
-			bool		queries_element_pass_by_value;
-			char		queries_element_align;
-			Datum		*queries_datum_list;
-			int			queries_num_datums;
-			int			q;
-			ArrayType	*setups_array;
-			Oid			setups_oid;
-			int16		setups_element_length;
-			bool		setups_element_pass_by_value;
-			char		setups_element_align;
-			Datum		*setups_datum_list;
-			int			setups_num_datums;
-
 			PGconn		*first_connection;
 			worker		*cur_worker;
 
@@ -455,41 +485,14 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 							(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 							 errmsg("queries cannot be null")));
 			}
-			queries_array = DatumGetArrayTypeP(query_manifest_t_attr_datums[QUERY_MANIFEST_QUERIES_ATTR_INDEX]);
-
-			/* queries_array must contain no nulls */
-			if (array_contains_nulls(queries_array))
+			if ( unpack_datum_to_cstring_array( query_manifest_t_attr_datums[QUERY_MANIFEST_QUERIES_ATTR_INDEX],
+												&(m->queries),
+												&(m->num_queries) ) == ARRAY_CONTAINS_NULLS)
 			{
 				ereport(ERROR,
 								(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 								 errmsg("queries array must not contain nulls")));
 			}
-
-			/* extract queries type info from dictionary */
-			queries_oid = ARR_ELEMTYPE(queries_array);
-			get_typlenbyvalalign(	queries_oid,
-									&queries_element_length,
-									&queries_element_pass_by_value,
-									&queries_element_align);
-
-			/* translate queries_array into list of Datums queries_datum_list */
-			deconstruct_array(	queries_array,
-								queries_oid,
-								queries_element_length,
-								queries_element_pass_by_value,
-								queries_element_align,
-								&queries_datum_list,
-								NULL,
-								&queries_num_datums);
-
-			m->queries = (char**) palloc0( sizeof(char*) * queries_num_datums );
-			for (q = 0; q < queries_num_datums; q++)
-			{
-				text	*query_text = DatumGetTextP(queries_datum_list[q]);
-				m->queries[q] = text_to_cstring(query_text);
-			}
-
-			m->num_queries = queries_num_datums;
 
 			if (query_manifest_t_attr_nulls[QUERY_MANIFEST_SETUP_COMMANDS_ATTR_INDEX])
 			{
@@ -497,38 +500,14 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 			}
 			else
 			{
-				setups_array = DatumGetArrayTypeP(query_manifest_t_attr_datums[QUERY_MANIFEST_SETUP_COMMANDS_ATTR_INDEX]);
-				/* setups_array must contain no nulls */
-				if (array_contains_nulls(setups_array))
+				if ( unpack_datum_to_cstring_array( query_manifest_t_attr_datums[QUERY_MANIFEST_SETUP_COMMANDS_ATTR_INDEX],
+													&(m->setup_commands),
+													&(m->num_setup_commands) ) == ARRAY_CONTAINS_NULLS)
 				{
 					ereport(ERROR,
 									(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 									 errmsg("setup_commands array must not contain nulls")));
 				}
-				/* extract queries type info from dictionary */
-				setups_oid = ARR_ELEMTYPE(setups_array);
-				get_typlenbyvalalign(	setups_oid,
-										&setups_element_length,
-										&setups_element_pass_by_value,
-										&setups_element_align);
-
-				/* translate setups_array into list of Datums setups_datum_list */
-				deconstruct_array(	setups_array,
-									setups_oid,
-									setups_element_length,
-									setups_element_pass_by_value,
-									setups_element_align,
-									&setups_datum_list,
-									NULL,
-									&setups_num_datums);
-				m->setup_commands = (char**) palloc0( sizeof(char*) * setups_num_datums );
-				for (q = 0; q < setups_num_datums; q++)
-				{
-					text	*setup_text = DatumGetTextP(setups_datum_list[q]);
-					m->setup_commands[q] = text_to_cstring(setup_text);
-				}
-
-				m->num_setup_commands = setups_num_datums;
 			}
 
 			first_connection = make_async_connection(m);
@@ -587,15 +566,15 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 		}
 		ReleaseTupleDesc(query_manifest_t_tupdesc);
 
-		outrs_tupdesc = CreateTupleDescCopy(rsinfo->expectedDesc);
-		outrs_attinmeta = TupleDescGetAttInMetadata(outrs_tupdesc);
-
 		/* let the caller know we're sending back a tuplestore */
 		rsinfo->returnMode = SFRM_Materialize;
 		per_query_ctx = fcinfo->flinfo->fn_mcxt;
 		oldcontext = MemoryContextSwitchTo(per_query_ctx);
-
+		outrs_tupdesc = CreateTupleDescCopy(rsinfo->expectedDesc);
 		outrs_tupstore = tuplestore_begin_heap(true,false,work_mem);
+		MemoryContextSwitchTo(oldcontext);
+
+		outrs_attinmeta = TupleDescGetAttInMetadata(outrs_tupdesc);
 
 		while(total_number_of_workers > 0)
 		{
@@ -618,7 +597,8 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 							/* connection is busy and there is more than one connection to wait on */
 							connection_active = true;
 						}
-						else {
+						else
+						{
 							/* 
 							 * connection is either no longer busy, or it's the last connection so
 							 * there's no point in looking elsewhere
