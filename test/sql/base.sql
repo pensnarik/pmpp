@@ -1,21 +1,20 @@
-
-
-\echo roles must exist on both sides of the connection so they cannot be created in a transaction
+--
+-- roles must exist on both sides of the connection so they cannot be created in a transaction
+--
 \set pmpp_test_user 'pmpp_test_user'
 \set password 'dummy';
 \set nopw_test_user 'nopw_test_user'
 create role :pmpp_test_user password :'password' login;
 create role :nopw_test_user password '' login;
 grant pmpp to :pmpp_test_user, :nopw_test_user;
-create schema dblink_test_schema;
-create extension dblink schema dblink_test_schema;
 create extension postgres_fdw; -- a user-mappings convenience, not a dependency
 create extension pmpp;
+
+select sign(pmpp.num_cpus());
 
 select  current_database() as dbname,
         'dbname=' || current_database() as loopback_su_conn_str
 \gset 
-
 
 \set pmpp_localhost_server 'localhost_server'
 
@@ -29,18 +28,7 @@ select  format('[{"connection": "%s", "query": "select 1"}]',
                 :'pmpp_localhost_server') as json_str_div_zero
 \gset 
 
-----
--- test disconnect()
-select  dblink_test_schema.dblink_connect('pmpp.999',:'loopback_su_conn_str');
-select *
-from unnest(dblink_test_schema.dblink_get_connections()) as c;
-select  pmpp.disconnect();
-select *
-from unnest(dblink_test_schema.dblink_get_connections()) as c;
-
-
-select  *
-from    pmpp.execute_command('analyze');
+select pmpp.to_query_manifest('{"connection": "foo"}'::jsonb);
 
 create table parallel_index_test( b integer, c integer, d integer );
 grant all on parallel_index_test to public;
@@ -58,35 +46,9 @@ from    parallel_index_test
 group by b
 order by b;
 
-select  b, sum(c), sum(d)
-from    pmpp.distribute(null::parallel_index_test,
-                        'dbname=' || current_database(),
-                        array(  select  format('select %s, sum(c), sum(d) from parallel_index_test where b = %s',b.b,b.b)
-                                from    generate_series(1,10) as b ))
-group by b
-order by b;
-
-
-select dblink_test_schema.dblink_exec(:'loopback_su_conn_str','create index pit1 on parallel_index_test(c)');
-select dblink_test_schema.dblink_exec(:'loopback_su_conn_str','drop index pit1');
-
-select * from pmpp.execute_command('create index pit1 on parallel_index_test(c)');
-select * from pmpp.execute_command('drop index pit1');
-
-
-select  *
-from    pmpp.meta('dbname=' || current_database(), 
-                    array(  select format('create index on %s(%s)',c.table_name,c.column_name)
-                            from    information_schema.columns c
-                            where   c.table_name = 'parallel_index_test'
-                            and     c.table_schema = 'public'))
-order by 1;
-
-\d+ parallel_index_test
-
-
-----
+--
 -- test cast of array which tests cast of pmpp.query_manifest as well
+--
 select  t.*
 from    unnest(:'json_str_1'::jsonb::pmpp.query_manifest[]) t;
 
@@ -115,6 +77,30 @@ from    pmpp.manifest_set(:'json_str_1'::jsonb) as t;
 select *
 from    pmpp.distribute(null::x, :'json_str_1'::jsonb);
 
+--
+-- test meta() which is just distribute() with a specific result set
+--
+select  *
+from    pmpp.meta('dbname=' || current_database(), 
+                    array(  select format('create index on %s(%s)',c.table_name,c.column_name)
+                            from    information_schema.columns c
+                            where   c.table_name = 'parallel_index_test'
+                            and     c.table_schema = 'public'),
+                    setup_commands := array ['set application_name = indexer','set client_encoding = UTF8'])
+order by 1;
+
+\d+ parallel_index_test
+
+select  b, sum(c), sum(d)
+from    pmpp.distribute(null::parallel_index_test,
+                        'dbname=' || current_database(),
+                        array(  select  format('select %s, sum(c), sum(d) from parallel_index_test where b = %s',b.b,b.b)
+                                from    generate_series(1,10) as b ))
+group by b
+order by b;
+
+
+
 
 
 create server :pmpp_localhost_server foreign data wrapper postgres_fdw
@@ -122,20 +108,37 @@ options (host 'localhost', dbname :'dbname' );
 
 create user mapping for public server :pmpp_localhost_server options(user :'pmpp_test_user', password :'password');
 
+--
+-- test normal legit queryset
+--
 select *
 from    pmpp.distribute(null::x,:'pmpp_localhost_server',array['select 1','select 2','select 3']);
 
+--
+-- test result set with too many columns
+--
+select *
+from    pmpp.distribute(null::x,:'pmpp_localhost_server',array['select 1','select 2','select 3, 4']);
+
+--
+-- test result set with right number of columns but wrong type
+--
+select *
+from    pmpp.distribute(null::x,:'pmpp_localhost_server',array['select 1','select ''2016-01-01''::date','select 3']);
+
+
+--
+-- test legit json input
+--
 select *
 from    pmpp.distribute(null::x, :'json_str_2'::jsonb);
 
+--
+-- test a query that times out
+--
 select *
 from    pmpp.distribute(null::x, :'json_str_timeout'::jsonb);
 
-select *
-from unnest(dblink_test_schema.dblink_get_connections()) as c;
-select pmpp.disconnect();
-select *
-from unnest(dblink_test_schema.dblink_get_connections()) as c;
 
 select *
 from pmpp.broadcast(null::x, array[ :'loopback_su_conn_str' , :'pmpp_localhost_server' ], 'select 1');
@@ -143,17 +146,17 @@ from pmpp.broadcast(null::x, array[ :'loopback_su_conn_str' , :'pmpp_localhost_s
 select *
 from    pmpp.distribute(null::x, :'json_str_div_zero'::jsonb);
 
-select *
-from unnest(dblink_test_schema.dblink_get_connections()) as c;
-select pmpp.disconnect();
-select *
-from unnest(dblink_test_schema.dblink_get_connections()) as c;
-
 drop user mapping for public server :pmpp_localhost_server;
 create user mapping for public server :pmpp_localhost_server options(user :'nopw_test_user', password '');
 
 select *
 from    pmpp.distribute(null::x, :'json_str_2'::jsonb);
+
+
+select *
+from    pmpp.distribute(null::x, '[{"connection": "bad_connstr_1", "query": "select 1"},'
+                                 '{"connection": "bad_connstr2", "query": "select 2", '
+                                 '  "setup_commands": ["set application_name = test1", "set client_encoding = UTF8" ] }]'::jsonb); 
 
 drop role :pmpp_test_user;
 drop role :nopw_test_user;

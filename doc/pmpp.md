@@ -61,7 +61,7 @@ With this query, the individual partial aggregate queries will be run independen
 
 Build all indexes for a table at the same time, up to the number of CPUs on the db machine.
 
-```
+```sql
 CREATE TABLE parallel_index_test( b integer, c integer, d integer);
 SELECT  *
 FROM pmpp.meta('dbname=' || current_database(),
@@ -117,7 +117,7 @@ function distribute(
             sql_list text[],
             cpu_multiplier float default 1.0,
             num_workers integer default null,
-            statement_timeout integer default null) returns setof anyelement
+            setup_commands text[] default null) returns setof anyelement
 ```
 
 This is the simplest form of the `distribute()` function, geared more towards local parallelism rather than sharding.
@@ -125,11 +125,11 @@ This is the simplest form of the `distribute()` function, geared more towards lo
 #### Parameters:
 
 * **row_type**: a null value casted to the type or table which specifies the shape of the result set that will be returned by this function. The result sets of all queries in `sql_list` will be coerced to fit this result set, if possible. If not possible, then the function will fail.
-* **connection**: a text string that represents a valid connection_string to dblink(). It can be any valid connection string that could be passed to `psql` on the command line, or it can be the name of a foreign server already defined on the local database. It is passed as-is to `dblink_connect`, so if dblink can use it, it's valid.
-* **sql_list**: an array of text, each element being an executable statement, almost always a SELECT, though any statement that can be executed over dblink() is possible. Each element of the array must be valid SQL, and it must reference objects found on the connection `connection`. The result set generated needs to be coercable into `row_type`, though it should be noted that only column order and (approximate, coercable) type matter, column names do not matter. 
+* **connection**: a text string that can be any valid connection string that could be passed to `psql` on the command line, or it can be the name of a foreign server already defined on the local database. 
+* **sql_list**: an array of text, each element being a valid SQL SELECT statement. The statements must reference objects found on the connection `connection`. The result set generated needs to be coercable into `row_type`, though it should be noted that only column order and (approximate, coercable) type matter, column names do not matter. 
 * **cpu_multiplier** (often omitted, defaults to 1.0): Specifies the number of connections to make to `connection` relative to the number of CPUs found on that machine, but never less than one or more than the number of array elements in `queries`. A value of 2.0 means to make two connections per CPU, 0.25 means one connection per four CPUs, etc. This value is trumped by `num_workers`. If this value is specified (and `num_workers` is not) then the connection `connection` *must* have PMPP installed.
 * **num_workers** (often omitted/null): If set, specifies the max number of connections to `connection` to make. PMPP will never make more connections than there are queries to run for that `connection`. Specifying this value overrides any value in `cpu_multiplier`. This value is requires if the database at `connection` does not have PMPP installed.
-* **statement_timeout** (often omitted/null): If set, each connection to `connection` has `SET statement_timeout=<value>` executed after the connection is established.
+* **setup_commands** (often omitted/null): If set, each connection to `connection` will execute each of the statements, in the order given, after the connection is established and before executing any the queries in `sql_list`. Any errors caused by these statements will cause the overall statement to itself fail. The results of these statements will not be returned through the function, so the only obvious uses are commands such at `set application_name = ...` and `set client_encoding = ...`.
 
 The number of connections created is never less than one, and never more than the number of queries in `sql_list`. When a query completes, its results are passed along to the output result set, and the function will give the connection another query, if any remain. When no more queries are available for distribution, the connection will be disconnected. When all connections have disconnected, the function returns the combined result set.
 
@@ -166,7 +166,7 @@ type query_manifest as (
          queries text[], 
          num_workers integer, 
          cpu_multiplier float, 
-         statement_timeout integer );
+         setup_commands text[] );
 ```
 
 Each of these attributes exactly matches the purpose described by the same-named parameters in the single database version of `distribute()`.
@@ -266,10 +266,10 @@ function meta(
             sql_list text[],
             cpu_multiplier float default null,
             num_workers integer default null,
-            statement_timeout integer default null) returns setof command_with_result
+            setup_commands text[] default null) returns setof command_with_result
 ```
 
-Each statement in `sql_list` is wrapped in a `SELECT pmpp.execute_command(<statement>)`, which returns a type `command_with_result` which looks like this: 
+The result set is of the type `command_with_result`, which looks like this:
 
 ```sql
 type command_with_result ( command text, result text );
@@ -329,26 +329,6 @@ FROM pmpp.broadcast(null::x,
 
 ### Other functions
 
-#### execute_command
-
-```sql
-function execute_command(sql text) RETURNS command_with_result
-```
-
-Executes the command `sql` and returns that string along with a returncode of `'OK'` or `'FAIL'`. 
-
-This function is used inside `meta()`. It is not particularly useful on its own.
-
-##### Example:
-
-```
-SELECT * from pmpp.execute_command('analyze');
- command | result
----------+--------
- analyze | OK
-(1 row)
-```
-
 ### Internal functions of no direct utility to the user
 
 Presented mostly to alleviate curiosity.
@@ -359,7 +339,7 @@ Presented mostly to alleviate curiosity.
 function jsonb_array_to_text_array(jsonb jsonb) returns text[]
 ```
 
-PostgreSQL current has no function to convert direction from a JSONB array to a text[].
+PostgreSQL currently has no function to convert direction from a JSONB array to a text[].
 
 #### num_cpus
 
@@ -369,19 +349,6 @@ function num_cpus() RETURNS integer
 
 Returns the number of CPUs detected on this machine at the time the extension was added.
 
-```sql
-function num_cpus(multiplier float) RETURNS integer
-```
-
-Returns `multiplier * num_cpus()`, but never less than 1. 
-
-
-#### disconnect
-```sql
-function disconnect() returns setof text
-```
-
-Cancels all active queries and disconnects from all connections created by PMPP. This is really only useful if the query dies and PMPP somehow fails to clean up after itself.    
 
 #### query_manifest functions
 
@@ -415,26 +382,13 @@ Extracts an array of `query_manifest` records from a `jsonb` object.
 * Objects and data created by the parent connection but not yet committed are **not** visible to the connections created by PMPP.
 * The connection specified may not be the same user as the calling function, and thus may not have the same object permissions as the parent connection.
 * If a sub-query fails, PMPP will *try* to cancel all other sub-queries and disconnect from those connections.
-* Replica databases are completely read-only, so it is not possible to create temporary tables on them.
-* In situations where the remote machine isn't a "real" PostgreSQL instance, but instead another database that happens to use the libpq protocol (Redshift, Vertica), the `num_workers` parameter *must* be specified.
+* In situations where the remote machine isn''t a "real" PostgreSQL instance, but instead another database that happens to use the libpq protocol (Redshift, Vertica), the `num_workers` parameter *must* be specified.
 * When querying a database that has it's own massively-parallel engine (Redshift, Vertica), there is no point in starting more than one worker per server, so set `num_workers=1`.
 
 
 ## Under The Hood.
 
-Parallel querying is accomplished through usage of the async funcions in the [dblink](http://www.postgresql.org/docs/current/static/dblink.html) extension. Queue management is currently implemented in temp tables with plpgsql, though it may be necessary to recode it in C due to some shortcomings of pl/pgsql.
-
-## Wishlist
-
-A few things that could make PMPP better.
-
-* Polymorphic `dblink()` functions or `TYPE`ing of `SETOF RECORD` functions.
-    The function call to `dblink_get_result()` is dynamic because the typecast is not known until runtime.
-    This is being worked on for PostgreSQL 9.6.
-
-* Ability to fetch `PQcmdStatus(PGresult *res)` from PL/PGSQL
-
-    Currently only success or failure is detected.
+Parallel querying is accomplished through usage of the async libpq functions, and some supporting code borrowed from the [dblink](http://www.postgresql.org/docs/current/static/dblink.html) extension. Queue management is handled through internal data structures, and no longer uses temp tables.
 
 ### Support
 
@@ -446,13 +400,10 @@ Corey Huinker, while working at [Moat](http://moat.com)
 
 ### Copyright and License
 
-Copyright (c) 2015, Moat Inc.
+Copyright (c) 2016, Moat Inc.
 
 Permission to use, copy, modify, and distribute this software and its documentation for any purpose, without fee, and without a written agreement is hereby granted, provided that the above copyright notice and this paragraph and the following two paragraphs appear in all copies.
 
 IN NO EVENT SHALL MOAT INC. BE LIABLE TO ANY PARTY FOR DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, INCLUDING LOST PROFITS, ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN IF Moat, Inc. HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 MOAT INC. SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE. THE SOFTWARE PROVIDED HEREUNDER IS ON AN "AS IS" BASIS, AND Moat, Inc. HAS NO OBLIGATIONS TO PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
-
-
-
