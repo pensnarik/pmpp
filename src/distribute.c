@@ -711,8 +711,8 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 
 			if (!got_a_result)
 			{
-				/* all connections were busy, wait a bit before bothering them again */
-				DirectFunctionCall1(pg_sleep,Float8GetDatum((float8)0.1));
+				/* sleep just enough to give up the timeslice, no sense monopolizing a CPU */
+				pg_usleep(1);
 			}
 		}
 
