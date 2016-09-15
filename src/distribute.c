@@ -592,7 +592,7 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 					if (cur_worker->connection != NULL)
 					{
 						PQconsumeInput(cur_worker->connection);
-						if ((PQisBusy(cur_worker->connection) == 1) && (total_number_of_workers > 1))
+						if ((total_number_of_workers > 1) && (PQisBusy(cur_worker->connection) == 1))
 						{
 							/* connection is busy and there is more than one connection to wait on */
 							connection_active = true;
@@ -695,6 +695,7 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 								/* close connection and mark the worker as done */
 								PQfinish(cur_worker->connection);
 								cur_worker->connection = NULL;
+								total_number_of_workers--;
 							}
 
 							connection_active = true;
@@ -710,8 +711,8 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 
 			if (!got_a_result)
 			{
-				/* all connections were busy, wait a bit before bothering them again */
-				DirectFunctionCall1(pg_sleep,Float8GetDatum(0.1));
+				/* sleep just enough to give up the timeslice, no sense monopolizing a CPU */
+				pg_usleep(1);
 			}
 		}
 
