@@ -209,10 +209,10 @@ CONTEXT:  SQL function "distribute" statement 1
 --
 -- test result set with right number of columns but wrong type
 --
-/*
 select *
 from    pmpp.distribute(null::x,:'pmpp_localhost_server',array['select 1','select ''2016-01-01''::date','select 3']);
-*/
+ERROR:  result rowtype column date has type date which cannot be coerced into expected column y of type integer. connection: localhost_server query: select '2016-01-01'::date
+CONTEXT:  SQL function "distribute" statement 1
 --
 -- test legit json input
 --

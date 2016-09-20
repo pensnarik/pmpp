@@ -123,10 +123,8 @@ from    pmpp.distribute(null::x,:'pmpp_localhost_server',array['select 1','selec
 --
 -- test result set with right number of columns but wrong type
 --
-/*
 select *
 from    pmpp.distribute(null::x,:'pmpp_localhost_server',array['select 1','select ''2016-01-01''::date','select 3']);
-*/
 
 
 --

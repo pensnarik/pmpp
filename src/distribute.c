@@ -16,6 +16,7 @@
 #include "utils/palloc.h"
 #include "utils/typcache.h"
 #include "libpq-fe.h"
+#include "parser/parse_coerce.h"
 #include <math.h>
 
 
@@ -396,6 +397,10 @@ pmpp_distribute(PG_FUNCTION_ARGS)
     binary_typioparams = (Oid*) palloc(rsinfo->expectedDesc->natts * sizeof(Oid));
 	binary_fmgrinfo = (FmgrInfo*) palloc(rsinfo->expectedDesc->natts * sizeof(FmgrInfo));
 
+	/*
+	for every column in the result set, get the binary input function and keep it so we don't have
+	to look it up every row of a subquery
+	*/
 	for (i = 0; i < rsinfo->expectedDesc->natts; i++)
 	{
 		Oid input_function;
@@ -655,8 +660,9 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 									if (ntuples > 0)
 									{
 										int			row;
-										bool       *type_matches = (bool*) palloc(nfields * sizeof(bool));
 										bool		binary_result_set = PQbinaryTuples(result);
+										bool       *type_matches = (bool*) palloc(nfields * sizeof(bool));
+										bool       *coerce_column = (bool*) palloc(nfields * sizeof(bool));
 										Oid        *alternate_typioparams =
 														(Oid*) palloc(rsinfo->expectedDesc->natts * sizeof(Oid));
 										FmgrInfo   *alternate_fmgrinfos =
@@ -665,6 +671,8 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 														(FmgrInfo*) palloc(rsinfo->expectedDesc->natts * sizeof(FmgrInfo));
 										int32	   *alternate_typmods = 
 														(int*) palloc(rsinfo->expectedDesc->natts * sizeof(int32));
+										FmgrInfo   *coercion_functions =
+														(FmgrInfo*) palloc(rsinfo->expectedDesc->natts * sizeof(FmgrInfo));
 
 										/*
 											check found columns oids vs expected oids, derive alternate functions only
@@ -674,30 +682,53 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 										{
 											Oid input_function;
 											Oid output_function;
+											Oid coercion_function;
 											bool is_varlena;
 											Oid column_oid = PQftype(result,i);
+											CoercionPathType pathtype;
 											type_matches[i] = (column_oid == outrs_tupdesc->attrs[i]->atttypid);
+											coerce_column[i] = false;
 
 											if (type_matches[i])
 												continue;
 
-											ereport(LOG,
-													(errmsg("result set column %d expected type oid %d but found %d, coercing. connection: %s query: %s",
-															i,outrs_tupdesc->attrs[i]->atttypid,column_oid,
-															cur_worker->connstr, cur_worker->current_query)));
-
-											/* TODO: attempt to find a shortcut via find_coercion_pathway() instead of O/I */
-
-											/* only derive the alternate functions where needed */
-											/* the binary input for what-we-got...*/
+											/* derive the binary input for what-we-got...*/
 											getTypeBinaryInputInfo(column_oid,
 													&input_function,&alternate_typioparams[i]);
 											fmgr_info(input_function, &alternate_fmgrinfos[i]);
-											/* ...and the text output of what-we-got */
-											getTypeOutputInfo(column_oid,
-													&output_function,&is_varlena);
-											fmgr_info(output_function, &text_output_functions[i]);
-											alternate_typmods[i] = PQfmod(result,i);
+
+											pathtype = find_coercion_pathway(outrs_tupdesc->attrs[i]->atttypid,
+																				column_oid,
+																				COERCION_ASSIGNMENT,
+																				&coercion_function);
+											switch(pathtype)
+											{
+												case COERCION_PATH_RELABELTYPE:
+													/* no-op conversion, use original intput function */
+													type_matches[i] = true;
+													break;
+												case COERCION_PATH_FUNC:
+													fmgr_info(coercion_function, &coercion_functions[i]);
+													coerce_column[i] = true;
+													break;
+												case COERCION_PATH_COERCEVIAIO:
+													/* derive the text output of what-we-got, we already have the text input */
+													getTypeOutputInfo(column_oid,
+															&output_function,&is_varlena);
+													fmgr_info(output_function, &text_output_functions[i]);
+													alternate_typmods[i] = PQfmod(result,i);
+												default:
+													ereport(ERROR,
+															(errcode(ERRCODE_DATATYPE_MISMATCH),
+															 errmsg("result rowtype column %s has type %s which cannot be coerced into expected column %s of type %s. connection: %s query: %s",
+																	PQfname(result,i),
+																	format_type_be(column_oid),
+																	outrs_tupdesc->attrs[i]->attname.data,
+																	format_type_be(outrs_tupdesc->attrs[i]->atttypid),
+																	cur_worker->connstr,
+																	cur_worker->current_query)));
+											}
+
 										}
 
 										/* put all tuples into the tuplestore */
@@ -716,11 +747,12 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 												{
 													if (PQgetisnull(result, row, i))
 													{
-														binary_values[i] = (Datum) 0; /* NULL; */
 														binary_nulls[i] = true;
+														binary_values[i] = (Datum) 0; /* NULL; */
 													}
 													else
 													{
+														binary_nulls[i] = false;
 														resetStringInfo(&sbuf);
 														appendBinaryStringInfo(&sbuf,
 																				PQgetvalue(result, row, i),
@@ -728,6 +760,7 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 																				
 														if (type_matches[i])
 														{
+															/* exact match - go straight to the values array */
 															binary_values[i] = ReceiveFunctionCall(&binary_fmgrinfo[i],
 																					&sbuf,
 																					binary_typioparams[i],
@@ -735,17 +768,25 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 														}
 														else
 														{
+															/* inexact match - save to a datum for later processing */
 															Datum d = ReceiveFunctionCall(&alternate_fmgrinfos[i],
 																					&sbuf,
 																					alternate_typioparams[i],
 																					alternate_typmods[i]);
-
-															binary_values[i] = InputFunctionCall(&outrs_attinmeta->attinfuncs[i],
-																								OutputFunctionCall(&text_output_functions[i],d),
-																							   outrs_attinmeta->attioparams[i],
-																							   outrs_attinmeta->atttypmods[i]);
+															if (coerce_column[i])
+															{
+																/* use coercion function we discovered earlier */
+																binary_values[i] = FunctionCall1(&coercion_functions[i],d);
+															}
+															else
+															{
+																/* use output+input functions to switch types */
+																binary_values[i] = InputFunctionCall(&outrs_attinmeta->attinfuncs[i],
+																					OutputFunctionCall(&text_output_functions[i],d),
+																				   outrs_attinmeta->attioparams[i],
+																				   outrs_attinmeta->atttypmods[i]);
+															}
 														}
-														binary_nulls[i] = false;
 													}
 												}
 												errcallback.callback = worker_error_callback;
@@ -759,6 +800,7 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 											}
 											else
 											{
+												/* text-mode result set fetching is a lot simpler */
 												int			i;
 												for (i = 0; i < nfields; i++)
 												{
@@ -784,7 +826,7 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 								{
 									/* Non-query commands only return one row (query,status) */
 									ErrorContextCallback errcallback;
-									/* char	  **text_values = (char **) palloc(2 * sizeof(char *)); */
+									char	  **command_values = (char **) palloc(2 * sizeof(char *));
 									HeapTuple	tuple;
 
 									errcallback.callback = worker_error_callback;
@@ -792,9 +834,9 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 									errcallback.previous = error_context_stack;
 									error_context_stack = &errcallback;
 
-									text_values[0] = cur_worker->current_query;
-									text_values[1] = PQcmdStatus(result);
-									tuple = BuildTupleFromCStrings(outrs_attinmeta, text_values);
+									command_values[0] = cur_worker->current_query;
+									command_values[1] = PQcmdStatus(result);
+									tuple = BuildTupleFromCStrings(outrs_attinmeta, command_values);
 									error_context_stack = errcallback.previous;
 									tuplestore_puttuple(outrs_tupstore, tuple);
 								}
@@ -805,6 +847,10 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 								PQclear(result);
 							}
 						
+							/*
+							fetching this result set took time, so we don't have to sleep before asking
+							other connections if they are done
+							*/
 							got_a_result = true;
 							if (m->next_query < m->num_queries)
 							{
@@ -843,6 +889,7 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 
 			if (!connection_active)
 			{
+				/* no more connections are active, time to wrap up */
 				break;
 			}
 
