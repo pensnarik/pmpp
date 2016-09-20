@@ -123,8 +123,10 @@ from    pmpp.distribute(null::x,:'pmpp_localhost_server',array['select 1','selec
 --
 -- test result set with right number of columns but wrong type
 --
+/*
 select *
 from    pmpp.distribute(null::x,:'pmpp_localhost_server',array['select 1','select ''2016-01-01''::date','select 3']);
+*/
 
 
 --
@@ -146,11 +148,13 @@ from pmpp.broadcast(null::x, array[ :'loopback_su_conn_str' , :'pmpp_localhost_s
 select *
 from    pmpp.distribute(null::x, :'json_str_div_zero'::jsonb);
 
+/*
 drop user mapping for public server :pmpp_localhost_server;
 create user mapping for public server :pmpp_localhost_server options(user :'nopw_test_user', password '');
 
 select *
 from    pmpp.distribute(null::x, :'json_str_2'::jsonb);
+*/
 
 
 select *

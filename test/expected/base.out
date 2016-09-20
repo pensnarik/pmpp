@@ -209,11 +209,10 @@ CONTEXT:  SQL function "distribute" statement 1
 --
 -- test result set with right number of columns but wrong type
 --
+/*
 select *
 from    pmpp.distribute(null::x,:'pmpp_localhost_server',array['select 1','select ''2016-01-01''::date','select 3']);
-ERROR:  invalid input syntax for integer: "2016-01-01"
-CONTEXT:  query: select '2016-01-01'::date on connection to: localhost_server
-SQL function "distribute" statement 1
+*/
 --
 -- test legit json input
 --
@@ -245,14 +244,13 @@ from    pmpp.distribute(null::x, :'json_str_div_zero'::jsonb);
 ERROR:  division by zero
 CONTEXT:  Error occurred on a connection to: localhost_server executing query: select 2/0.
 SQL function "distribute" statement 1
+/*
 drop user mapping for public server :pmpp_localhost_server;
 create user mapping for public server :pmpp_localhost_server options(user :'nopw_test_user', password '');
+
 select *
 from    pmpp.distribute(null::x, :'json_str_2'::jsonb);
-ERROR:  could not establish connection
-DETAIL:  fe_sendauth: no password supplied
-
-CONTEXT:  SQL function "distribute" statement 1
+*/
 select *
 from    pmpp.distribute(null::x, '[{"connection": "bad_connstr_1", "query": "select 1"},'
                                  '{"connection": "bad_connstr2", "query": "select 2", '
