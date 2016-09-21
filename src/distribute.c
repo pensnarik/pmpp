@@ -25,22 +25,28 @@
 #define QUERY_MANIFEST_CPU_MULTIPLIER_ATTR_INDEX 2
 #define QUERY_MANIFEST_NUM_WORKERS_ATTR_INDEX 3
 #define QUERY_MANIFEST_SETUP_COMMANDS_ATTR_INDEX 4
+#define QUERY_MANIFEST_RESULT_FORMAT_ATTR_INDEX 4
 
 #define ARRAY_OK 0
 #define ARRAY_CONTAINS_NULLS 1
 
-#define BINARY_MODE 1
+#define BINARY_MODE 0
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
 #endif
 
-
+typedef enum {
+	RESULT_FORMAT_ORIGINAL = 0,
+	RESULT_FORMAT_TEXT, 
+	RESULT_FORMAT_BINARY 
+} result_format_type;
 
 typedef struct {
 	PGconn	*connection;
 	char	*connstr;
 	char	*current_query;
+	result_format_type	result_format;
 } worker;
 
 /*
@@ -72,6 +78,11 @@ typedef struct {
 	setup_commands:
 		A list of commands (set application_name = ..., set session_timeout = ..., etc) that must be executed
 		by each connection prior to executing any queries in the queries attribute.
+	result_format:
+		A string of either NULL, "text", or "binary".
+		NULL is the default and means to use simple SendQuery() calls to the remote server
+		"text" means to use SendQueryParams(), but set result_format to 0
+		"binary" means to use SendQueryParams(), but set result_format to 1
 */
  
 typedef struct {
@@ -85,6 +96,7 @@ typedef struct {
 	worker	*workers;
 	char	**queries;
 	char	**setup_commands;
+	result_format_type	result_format;
 } query_manifest;
 
 /*
@@ -345,6 +357,227 @@ unpack_datum_to_cstring_array(Datum datum, char ***cstring_array, int *array_len
 	return ARRAY_OK;
 }
 
+/*
+ * send a query to the remote system using the method amenable to that remote system.
+ * report any errors in the sending process
+ */
+static void
+send_async_query(const worker* w)
+{
+	int rc;
+	switch (w->result_format)
+	{
+		case RESULT_FORMAT_BINARY:
+			rc = PQsendQueryParams(w->connection, w->current_query, 0, NULL, NULL, NULL, NULL, 1);
+			break;
+		case RESULT_FORMAT_TEXT:
+			rc = PQsendQueryParams(w->connection, w->current_query, 0, NULL, NULL, NULL, NULL, 0);
+			break;
+		default:
+			rc = PQsendQuery(w->connection, w->current_query);
+	}
+	if (rc != 1)
+	{
+		ereport(ERROR,
+				(errmsg("errors %s sending query: %s to connection %s",
+						PQerrorMessage(w->connection), w->current_query, w->connstr)));
+	}
+}
+
+/*
+ * fetch result set from old-school text mode results
+ */
+static
+void append_text_result_set(const PGresult	*result,
+							const worker *worker,
+							AttInMetadata	*outrs_attinmeta,
+							Tuplestorestate *outrs_tupstore)
+{
+	char **text_values; 
+	int ntuples = PQntuples(result);
+	int nfields = PQnfields(result);
+	int	row;
+	int col;
+
+	text_values = (char **) palloc(nfields * sizeof(char *));
+
+	for (row = 0; row < ntuples; row++)
+	{
+		ErrorContextCallback errcallback;
+		HeapTuple	tuple;
+
+		for (col = 0; col < nfields; col++)
+		{
+			if (PQgetisnull(result, row, col))
+				text_values[col] = NULL;
+			else
+				text_values[col] = PQgetvalue(result, row, col);
+		}
+		errcallback.callback = worker_error_callback;
+		errcallback.arg = (void *) worker;
+		errcallback.previous = error_context_stack;
+		error_context_stack = &errcallback;
+
+		/* build the tuple and put it into the tuplestore. */
+		tuple = BuildTupleFromCStrings(outrs_attinmeta, text_values);
+		error_context_stack = errcallback.previous;
+
+		tuplestore_puttuple(outrs_tupstore, tuple);
+	}
+}
+
+/*
+ * fetch result set from faster binary mode results
+ */
+static
+void append_binary_result_set(	const PGresult	*result,
+								const worker	*worker,
+								TupleDesc		outrs_tupdesc,
+								Datum			*binary_values,
+								bool			*binary_nulls,
+								Oid				*binary_typioparams,
+								FmgrInfo		*binary_fmgrinfo,
+								AttInMetadata	*outrs_attinmeta,
+								Tuplestorestate *outrs_tupstore)
+{
+	int ntuples = PQntuples(result);
+	int nfields = PQnfields(result);
+		
+	bool       *type_matches = (bool*) palloc(nfields * sizeof(bool));
+	bool       *coerce_column = (bool*) palloc(nfields * sizeof(bool));
+	Oid        *alternate_typioparams = (Oid*) palloc(nfields * sizeof(Oid));
+	FmgrInfo   *alternate_fmgrinfos = (FmgrInfo*) palloc(nfields * sizeof(FmgrInfo));
+	FmgrInfo   *text_output_functions = (FmgrInfo*) palloc(nfields * sizeof(FmgrInfo));
+	int32	   *alternate_typmods = (int*) palloc(nfields * sizeof(int32));
+	FmgrInfo   *coercion_functions = (FmgrInfo*) palloc(nfields * sizeof(FmgrInfo));
+
+	int	row;
+	int i;
+
+	/*
+		check found columns oids vs expected oids, derive alternate functions only
+		where needed
+	*/
+	for (i = 0; i < nfields; i++)
+	{
+		Oid input_function;
+		Oid output_function;
+		Oid coercion_function;
+		bool is_varlena;
+		Oid column_oid = PQftype(result,i);
+		CoercionPathType pathtype;
+		type_matches[i] = (column_oid == outrs_tupdesc->attrs[i]->atttypid);
+		coerce_column[i] = false;
+
+		if (type_matches[i])
+			continue;
+
+		/* derive the binary input for what-we-got...*/
+		getTypeBinaryInputInfo(column_oid,
+				&input_function,&alternate_typioparams[i]);
+		fmgr_info(input_function, &alternate_fmgrinfos[i]);
+
+		pathtype = find_coercion_pathway(outrs_tupdesc->attrs[i]->atttypid,
+											column_oid,
+											COERCION_ASSIGNMENT,
+											&coercion_function);
+		switch(pathtype)
+		{
+			case COERCION_PATH_RELABELTYPE:
+				/* no-op conversion, use original intput function */
+				type_matches[i] = true;
+				break;
+			case COERCION_PATH_FUNC:
+				fmgr_info(coercion_function, &coercion_functions[i]);
+				coerce_column[i] = true;
+				break;
+			case COERCION_PATH_COERCEVIAIO:
+				/* derive the text output of what-we-got, we already have the text input */
+				getTypeOutputInfo(column_oid,
+						&output_function,&is_varlena);
+				fmgr_info(output_function, &text_output_functions[i]);
+				alternate_typmods[i] = PQfmod(result,i);
+			default:
+				ereport(ERROR,
+						(errcode(ERRCODE_DATATYPE_MISMATCH),
+						 errmsg("result rowtype column %s has type %s which cannot be coerced into expected column %s of type %s. connection: %s query: %s",
+								PQfname(result,i),
+								format_type_be(column_oid),
+								outrs_tupdesc->attrs[i]->attname.data,
+								format_type_be(outrs_tupdesc->attrs[i]->atttypid),
+								worker->connstr,
+								worker->current_query)));
+		}
+	}
+
+	/* put all tuples into the tuplestore */
+	for (row = 0; row < ntuples; row++)
+	{
+		ErrorContextCallback errcallback;
+		HeapTuple	tuple;
+
+		StringInfoData sbuf;
+		int			i;
+		initStringInfo(&sbuf);
+
+		for (i = 0; i < nfields; i++)
+		{
+			if (PQgetisnull(result, row, i))
+			{
+				binary_nulls[i] = true;
+				binary_values[i] = (Datum) 0; /* NULL; */
+			}
+			else
+			{
+				binary_nulls[i] = false;
+				resetStringInfo(&sbuf);
+				appendBinaryStringInfo(&sbuf,
+										PQgetvalue(result, row, i),
+										PQgetlength(result, row, i));
+										
+				if (type_matches[i])
+				{
+					/* exact match - go straight to the values array */
+					binary_values[i] = ReceiveFunctionCall(&binary_fmgrinfo[i],
+											&sbuf,
+											binary_typioparams[i],
+											outrs_tupdesc->attrs[i]->atttypmod);
+				}
+				else
+				{
+					/* inexact match - save to a datum for later processing */
+					Datum d = ReceiveFunctionCall(&alternate_fmgrinfos[i],
+											&sbuf,
+											alternate_typioparams[i],
+											alternate_typmods[i]);
+					if (coerce_column[i])
+					{
+						/* use coercion function we discovered earlier */
+						binary_values[i] = FunctionCall1(&coercion_functions[i],d);
+					}
+					else
+					{
+						/* use output+input functions to switch types */
+						binary_values[i] = InputFunctionCall(&outrs_attinmeta->attinfuncs[i],
+											OutputFunctionCall(&text_output_functions[i],d),
+										   outrs_attinmeta->attioparams[i],
+										   outrs_attinmeta->atttypmods[i]);
+					}
+				}
+			}
+		}
+		errcallback.callback = worker_error_callback;
+		errcallback.arg = (void *) worker;
+		errcallback.previous = error_context_stack;
+		error_context_stack = &errcallback;
+
+		/* build the tuple and put it into the tuplestore. */
+		tuple = heap_form_tuple(outrs_tupdesc, binary_values, binary_nulls);
+		error_context_stack = errcallback.previous;
+
+		tuplestore_puttuple(outrs_tupstore, tuple);
+	}
+}
 
 
 /*
@@ -382,7 +615,6 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 	bool		*query_manifest_t_attr_nulls = (bool *) palloc(query_manifest_t_tupdesc->natts * sizeof(bool));
 
 	/* Every result set fetched from a remote will have the same Datum signature, or ought to */
-	char	  **text_values; /* if text mode */
 	Datum      *binary_values;
 	bool       *binary_nulls;
     Oid        *binary_typioparams;
@@ -391,7 +623,6 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 	query_manifest	*manifest, *m;
 	int				total_number_of_workers = 0;
 
-	text_values = (char **) palloc(rsinfo->expectedDesc->natts * sizeof(char *));
 	binary_values = (Datum *) palloc(rsinfo->expectedDesc->natts * sizeof(Datum));
 	binary_nulls = (bool *) palloc(rsinfo->expectedDesc->natts * sizeof(bool));
     binary_typioparams = (Oid*) palloc(rsinfo->expectedDesc->natts * sizeof(Oid));
@@ -539,6 +770,29 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 				}
 			}
 
+			if (query_manifest_t_attr_nulls[QUERY_MANIFEST_RESULT_FORMAT_ATTR_INDEX])
+			{
+				m->result_format = RESULT_FORMAT_ORIGINAL;
+			}
+			else
+			{
+				char *s = text_to_cstring(DatumGetTextP(query_manifest_t_attr_datums[QUERY_MANIFEST_RESULT_FORMAT_ATTR_INDEX]));
+				if (strcmp(s,"binary") == 0)
+				{
+					m->result_format = RESULT_FORMAT_BINARY;
+				}
+				else if (strcmp(s,"text") == 0)
+				{
+					m->result_format = RESULT_FORMAT_TEXT;
+				}
+				else
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("result_format, if specified, must be one of: binary text")));
+				}
+			}
+
 			first_connection = make_async_connection(m);
 
 			/* in cases where num_workers wasn't explicit, we must either ask or infer the number */
@@ -576,21 +830,7 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 				cur_worker->connstr = m->connection_string;
 				cur_worker->current_query = m->queries[m->next_query];
 
-				if (PQsendQueryParams(cur_worker->connection,
-										cur_worker->current_query,
-										0,
-										NULL,
-										NULL,
-										NULL,
-										NULL,
-										BINARY_MODE) != 1)
-				{
-					ereport(ERROR,
-							(errmsg("errors %s sending query: %s to connection %s",
-									PQerrorMessage(cur_worker->connection),
-													cur_worker->current_query,
-													cur_worker->connstr)));
-				}
+				send_async_query(cur_worker);
 
 				m->next_query++;
 				if (m->next_query == m->num_workers)
@@ -644,11 +884,9 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 							{
 								if (PQresultStatus(result) == PGRES_TUPLES_OK)
 								{
-									int nfields;
-									int ntuples;
+									int nfields = PQnfields(result);
+									int ntuples = PQntuples(result);
 
-									nfields = PQnfields(result);
-									ntuples = PQntuples(result);
 									if (nfields != outrs_tupdesc->natts)
 									{
 										ereport(ERROR,
@@ -656,169 +894,19 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 												 errmsg("result rowtype does not match expected rowtype connection: %s query: %s",
 														cur_worker->connstr, cur_worker->current_query)));
 									}
-									
+
 									if (ntuples > 0)
 									{
-										int			row;
-										bool		binary_result_set = PQbinaryTuples(result);
-										bool       *type_matches = (bool*) palloc(nfields * sizeof(bool));
-										bool       *coerce_column = (bool*) palloc(nfields * sizeof(bool));
-										Oid        *alternate_typioparams =
-														(Oid*) palloc(rsinfo->expectedDesc->natts * sizeof(Oid));
-										FmgrInfo   *alternate_fmgrinfos =
-														(FmgrInfo*) palloc(rsinfo->expectedDesc->natts * sizeof(FmgrInfo));
-										FmgrInfo   *text_output_functions =
-														(FmgrInfo*) palloc(rsinfo->expectedDesc->natts * sizeof(FmgrInfo));
-										int32	   *alternate_typmods = 
-														(int*) palloc(rsinfo->expectedDesc->natts * sizeof(int32));
-										FmgrInfo   *coercion_functions =
-														(FmgrInfo*) palloc(rsinfo->expectedDesc->natts * sizeof(FmgrInfo));
-
-										/*
-											check found columns oids vs expected oids, derive alternate functions only
-											where needed
-										*/
-										for (i = 0; i < nfields; i++)
+										if (PQbinaryTuples(result))
 										{
-											Oid input_function;
-											Oid output_function;
-											Oid coercion_function;
-											bool is_varlena;
-											Oid column_oid = PQftype(result,i);
-											CoercionPathType pathtype;
-											type_matches[i] = (column_oid == outrs_tupdesc->attrs[i]->atttypid);
-											coerce_column[i] = false;
-
-											if (type_matches[i])
-												continue;
-
-											/* derive the binary input for what-we-got...*/
-											getTypeBinaryInputInfo(column_oid,
-													&input_function,&alternate_typioparams[i]);
-											fmgr_info(input_function, &alternate_fmgrinfos[i]);
-
-											pathtype = find_coercion_pathway(outrs_tupdesc->attrs[i]->atttypid,
-																				column_oid,
-																				COERCION_ASSIGNMENT,
-																				&coercion_function);
-											switch(pathtype)
-											{
-												case COERCION_PATH_RELABELTYPE:
-													/* no-op conversion, use original intput function */
-													type_matches[i] = true;
-													break;
-												case COERCION_PATH_FUNC:
-													fmgr_info(coercion_function, &coercion_functions[i]);
-													coerce_column[i] = true;
-													break;
-												case COERCION_PATH_COERCEVIAIO:
-													/* derive the text output of what-we-got, we already have the text input */
-													getTypeOutputInfo(column_oid,
-															&output_function,&is_varlena);
-													fmgr_info(output_function, &text_output_functions[i]);
-													alternate_typmods[i] = PQfmod(result,i);
-												default:
-													ereport(ERROR,
-															(errcode(ERRCODE_DATATYPE_MISMATCH),
-															 errmsg("result rowtype column %s has type %s which cannot be coerced into expected column %s of type %s. connection: %s query: %s",
-																	PQfname(result,i),
-																	format_type_be(column_oid),
-																	outrs_tupdesc->attrs[i]->attname.data,
-																	format_type_be(outrs_tupdesc->attrs[i]->atttypid),
-																	cur_worker->connstr,
-																	cur_worker->current_query)));
-											}
-
+											append_binary_result_set(result,cur_worker,outrs_tupdesc,
+																		binary_values, binary_nulls,
+																		binary_typioparams, binary_fmgrinfo,
+																		outrs_attinmeta,outrs_tupstore);
 										}
-
-										/* put all tuples into the tuplestore */
-										for (row = 0; row < ntuples; row++)
+										else
 										{
-											ErrorContextCallback errcallback;
-											HeapTuple	tuple;
-
-											if (binary_result_set)
-											{
-												StringInfoData sbuf;
-												int			i;
-												initStringInfo(&sbuf);
-
-												for (i = 0; i < nfields; i++)
-												{
-													if (PQgetisnull(result, row, i))
-													{
-														binary_nulls[i] = true;
-														binary_values[i] = (Datum) 0; /* NULL; */
-													}
-													else
-													{
-														binary_nulls[i] = false;
-														resetStringInfo(&sbuf);
-														appendBinaryStringInfo(&sbuf,
-																				PQgetvalue(result, row, i),
-																				PQgetlength(result, row, i));
-																				
-														if (type_matches[i])
-														{
-															/* exact match - go straight to the values array */
-															binary_values[i] = ReceiveFunctionCall(&binary_fmgrinfo[i],
-																					&sbuf,
-																					binary_typioparams[i],
-																					outrs_tupdesc->attrs[i]->atttypmod);
-														}
-														else
-														{
-															/* inexact match - save to a datum for later processing */
-															Datum d = ReceiveFunctionCall(&alternate_fmgrinfos[i],
-																					&sbuf,
-																					alternate_typioparams[i],
-																					alternate_typmods[i]);
-															if (coerce_column[i])
-															{
-																/* use coercion function we discovered earlier */
-																binary_values[i] = FunctionCall1(&coercion_functions[i],d);
-															}
-															else
-															{
-																/* use output+input functions to switch types */
-																binary_values[i] = InputFunctionCall(&outrs_attinmeta->attinfuncs[i],
-																					OutputFunctionCall(&text_output_functions[i],d),
-																				   outrs_attinmeta->attioparams[i],
-																				   outrs_attinmeta->atttypmods[i]);
-															}
-														}
-													}
-												}
-												errcallback.callback = worker_error_callback;
-												errcallback.arg = (void *) cur_worker;
-												errcallback.previous = error_context_stack;
-												error_context_stack = &errcallback;
-
-												/* build the tuple and put it into the tuplestore. */
-												tuple = heap_form_tuple(outrs_tupdesc, binary_values, binary_nulls);
-												error_context_stack = errcallback.previous;
-											}
-											else
-											{
-												/* text-mode result set fetching is a lot simpler */
-												int			i;
-												for (i = 0; i < nfields; i++)
-												{
-													if (PQgetisnull(result, row, i))
-														text_values[i] = NULL;
-													else
-														text_values[i] = PQgetvalue(result, row, i);
-												}
-												errcallback.callback = worker_error_callback;
-												errcallback.arg = (void *) cur_worker;
-												errcallback.previous = error_context_stack;
-												error_context_stack = &errcallback;
-
-												/* build the tuple and put it into the tuplestore. */
-												tuple = BuildTupleFromCStrings(outrs_attinmeta, text_values);
-												error_context_stack = errcallback.previous;
-											}
-											tuplestore_puttuple(outrs_tupstore, tuple);
+											append_text_result_set(result,cur_worker,outrs_attinmeta,outrs_tupstore);
 										}
 									}
 								}
@@ -842,6 +930,9 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 								}
 								else
 								{
+									ereport(WARNING,
+											(errmsg("PQresultstatus is %d binary mode is %d",
+													PQresultStatus(result),BINARY_MODE)));
 									res_error(result,cur_worker->connstr,cur_worker->current_query,true);
 								}
 								PQclear(result);
@@ -855,21 +946,7 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 							if (m->next_query < m->num_queries)
 							{
 								cur_worker->current_query = m->queries[m->next_query];
-								if (PQsendQueryParams(cur_worker->connection,
-														cur_worker->current_query,
-														0,
-														NULL,
-														NULL,
-														NULL,
-														NULL,
-														BINARY_MODE) != 1)
-								{
-									ereport(ERROR,
-											(errmsg("errors %s sending query: %s to connection %s",
-													PQerrorMessage(cur_worker->connection),
-																	cur_worker->current_query,
-																	cur_worker->connstr)));
-								}
+								send_async_query(cur_worker);
 								m->next_query++;
 								connection_active = true;
 							}
