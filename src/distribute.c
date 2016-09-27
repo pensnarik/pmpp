@@ -589,125 +589,127 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 				for (j = 0, cur_worker = (worker*) m->workers; j < m->num_workers; j++, cur_worker++)
 				{
 					/* skip connections that we've closed */
-					if (cur_worker->connection != NULL)
+					if (cur_worker->connection == NULL)
 					{
-						if (PQconsumeInput(cur_worker->connection) == 0)
-						{
-							ereport(ERROR,
-									(errmsg("error %s polling query: %s on connection %s",
-											PQerrorMessage(cur_worker->connection),
-															cur_worker->current_query,
-															cur_worker->connstr)));
-						}
+						continue;
+					}
 
-						if ((total_number_of_workers > 1) && (PQisBusy(cur_worker->connection) == 1))
+					if (PQconsumeInput(cur_worker->connection) == 0)
+					{
+						ereport(ERROR,
+								(errmsg("error %s polling query: %s on connection %s",
+										PQerrorMessage(cur_worker->connection),
+														cur_worker->current_query,
+														cur_worker->connstr)));
+					}
+
+					if ((total_number_of_workers > 1) && (PQisBusy(cur_worker->connection) == 1))
+					{
+						/* connection is busy and there is more than one connection to wait on */
+						connection_active = true;
+					}
+					else
+					{
+						/* 
+						 * connection is either no longer busy, or it's the last connection so
+						 * there's no point in looking elsewhere
+						 */
+						while ((result = PQgetResult(cur_worker->connection)) != NULL)
 						{
-							/* connection is busy and there is more than one connection to wait on */
+							if (PQresultStatus(result) == PGRES_TUPLES_OK)
+							{
+								int nfields;
+								int ntuples;
+
+								nfields = PQnfields(result);
+								ntuples = PQntuples(result);
+								if (nfields != outrs_tupdesc->natts)
+								{
+									ereport(ERROR,
+											(errcode(ERRCODE_DATATYPE_MISMATCH),
+											 errmsg("result rowtype does not match expected rowtype connection: %s query: %s",
+													cur_worker->connstr, cur_worker->current_query)));
+								}
+								
+								if (ntuples > 0)
+								{
+									char	  **values = (char **) palloc(nfields * sizeof(char *));
+									int			row;
+
+									/* put all tuples into the tuplestore */
+									for (row = 0; row < ntuples; row++)
+									{
+										ErrorContextCallback errcallback;
+										HeapTuple	tuple;
+										int			i;
+										for (i = 0; i < nfields; i++)
+										{
+											if (PQgetisnull(result, row, i))
+												values[i] = NULL;
+											else
+												values[i] = PQgetvalue(result, row, i);
+										}
+										errcallback.callback = worker_error_callback;
+										errcallback.arg = (void *) cur_worker;
+										errcallback.previous = error_context_stack;
+										error_context_stack = &errcallback;
+
+										/* build the tuple and put it into the tuplestore. */
+										tuple = BuildTupleFromCStrings(outrs_attinmeta, values);
+										error_context_stack = errcallback.previous;
+										tuplestore_puttuple(outrs_tupstore, tuple);
+									}
+								}
+							}
+							else if (PQresultStatus(result) == PGRES_COMMAND_OK)
+							{
+								/* Non-query commands only return one row (query,status) */
+								ErrorContextCallback errcallback;
+								char	  **values = (char **) palloc(2 * sizeof(char *));
+								HeapTuple	tuple;
+
+								errcallback.callback = worker_error_callback;
+								errcallback.arg = (void *) cur_worker;
+								errcallback.previous = error_context_stack;
+								error_context_stack = &errcallback;
+
+								values[0] = cur_worker->current_query;
+								values[1] = PQcmdStatus(result);
+								tuple = BuildTupleFromCStrings(outrs_attinmeta, values);
+								error_context_stack = errcallback.previous;
+								tuplestore_puttuple(outrs_tupstore, tuple);
+							}
+							else
+							{
+								res_error(result,cur_worker->connstr,cur_worker->current_query,true);
+							}
+							PQclear(result);
+						}
+					
+						got_a_result = true;
+						if (m->next_query < m->num_queries)
+						{
+							cur_worker->current_query = m->queries[m->next_query];
+							if (PQsendQuery(cur_worker->connection,cur_worker->current_query) != 1)
+							{
+								ereport(ERROR,
+										(errmsg("errors %s sending query: %s to connection %s",
+												PQerrorMessage(cur_worker->connection),
+																cur_worker->current_query,
+																cur_worker->connstr)));
+							}
+							m->next_query++;
 							connection_active = true;
 						}
 						else
 						{
-							/* 
-							 * connection is either no longer busy, or it's the last connection so
-							 * there's no point in looking elsewhere
-							 */
-							while ((result = PQgetResult(cur_worker->connection)) != NULL)
-							{
-								if (PQresultStatus(result) == PGRES_TUPLES_OK)
-								{
-									int nfields;
-									int ntuples;
-
-									nfields = PQnfields(result);
-									ntuples = PQntuples(result);
-									if (nfields != outrs_tupdesc->natts)
-									{
-										ereport(ERROR,
-												(errcode(ERRCODE_DATATYPE_MISMATCH),
-												 errmsg("result rowtype does not match expected rowtype connection: %s query: %s",
-														cur_worker->connstr, cur_worker->current_query)));
-									}
-									
-									if (ntuples > 0)
-									{
-										char	  **values = (char **) palloc(nfields * sizeof(char *));
-										int			row;
-
-										/* put all tuples into the tuplestore */
-										for (row = 0; row < ntuples; row++)
-										{
-											ErrorContextCallback errcallback;
-											HeapTuple	tuple;
-											int			i;
-											for (i = 0; i < nfields; i++)
-											{
-												if (PQgetisnull(result, row, i))
-													values[i] = NULL;
-												else
-													values[i] = PQgetvalue(result, row, i);
-											}
-											errcallback.callback = worker_error_callback;
-											errcallback.arg = (void *) cur_worker;
-											errcallback.previous = error_context_stack;
-											error_context_stack = &errcallback;
-
-											/* build the tuple and put it into the tuplestore. */
-											tuple = BuildTupleFromCStrings(outrs_attinmeta, values);
-											error_context_stack = errcallback.previous;
-											tuplestore_puttuple(outrs_tupstore, tuple);
-										}
-									}
-								}
-								else if (PQresultStatus(result) == PGRES_COMMAND_OK)
-								{
-									/* Non-query commands only return one row (query,status) */
-									ErrorContextCallback errcallback;
-									char	  **values = (char **) palloc(2 * sizeof(char *));
-									HeapTuple	tuple;
-
-									errcallback.callback = worker_error_callback;
-									errcallback.arg = (void *) cur_worker;
-									errcallback.previous = error_context_stack;
-									error_context_stack = &errcallback;
-
-									values[0] = cur_worker->current_query;
-									values[1] = PQcmdStatus(result);
-									tuple = BuildTupleFromCStrings(outrs_attinmeta, values);
-									error_context_stack = errcallback.previous;
-									tuplestore_puttuple(outrs_tupstore, tuple);
-								}
-								else
-								{
-									res_error(result,cur_worker->connstr,cur_worker->current_query,true);
-								}
-								PQclear(result);
-							}
-						
-							got_a_result = true;
-							if (m->next_query < m->num_queries)
-							{
-								cur_worker->current_query = m->queries[m->next_query];
-								if (PQsendQuery(cur_worker->connection,cur_worker->current_query) != 1)
-								{
-									ereport(ERROR,
-											(errmsg("errors %s sending query: %s to connection %s",
-													PQerrorMessage(cur_worker->connection),
-																	cur_worker->current_query,
-																	cur_worker->connstr)));
-								}
-								m->next_query++;
-								connection_active = true;
-							}
-							else
-							{
-								/* close connection and mark the worker as done */
-								PQfinish(cur_worker->connection);
-								cur_worker->connection = NULL;
-								total_number_of_workers--;
-							}
-
-							connection_active = true;
+							/* close connection and mark the worker as done */
+							PQfinish(cur_worker->connection);
+							cur_worker->connection = NULL;
+							total_number_of_workers--;
 						}
+
+						connection_active = true;
 					}
 				}
 			}
