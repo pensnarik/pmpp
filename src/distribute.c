@@ -983,7 +983,7 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 			if (!got_a_result)
 			{
 				/* sleep just enough to give up the timeslice, no sense monopolizing a CPU */
-				pg_usleep(1);
+				CHECK_FOR_INTERRUPTS();
 			}
 		}
 
