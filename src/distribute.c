@@ -856,7 +856,6 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 		while(total_number_of_workers > 0)
 		{
 			bool		got_a_result = false;
-			bool		connection_active = false;
 			int			i, j;
 			worker		*cur_worker;
 			PGresult	*result;
@@ -865,9 +864,9 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 			{
 				for (j = 0, cur_worker = (worker*) m->workers; j < m->num_workers; j++, cur_worker++)
 				{
-					/* skip connections that we've closed */
 					if (cur_worker->connection == NULL)
 					{
+						/* skip connections that we've closed */
 						continue;
 					}
 
@@ -883,104 +882,92 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 					if ((total_number_of_workers > 1) && (PQisBusy(cur_worker->connection) == 1))
 					{
 						/* connection is busy and there is more than one connection to wait on */
-						connection_active = true;
+						continue;
 					}
-					else
+					/* 
+					 * connection is either no longer busy, or it's the last connection so
+					 * there's no point in looking elsewhere
+					 */
+					while ((result = PQgetResult(cur_worker->connection)) != NULL)
 					{
-						/* 
-						 * connection is either no longer busy, or it's the last connection so
-						 * there's no point in looking elsewhere
-						 */
-						while ((result = PQgetResult(cur_worker->connection)) != NULL)
+						if (PQresultStatus(result) == PGRES_TUPLES_OK)
 						{
-							if (PQresultStatus(result) == PGRES_TUPLES_OK)
+							int nfields = PQnfields(result);
+							int ntuples = PQntuples(result);
+
+							if (nfields != outrs_tupdesc->natts)
 							{
-								int nfields = PQnfields(result);
-								int ntuples = PQntuples(result);
+								ereport(ERROR,
+										(errcode(ERRCODE_DATATYPE_MISMATCH),
+										 errmsg("result rowtype does not match expected rowtype connection: %s query: %s",
+												cur_worker->connstr, cur_worker->current_query)));
+							}
 
-								if (nfields != outrs_tupdesc->natts)
+							if (ntuples > 0)
+							{
+								if (PQbinaryTuples(result))
 								{
-									ereport(ERROR,
-											(errcode(ERRCODE_DATATYPE_MISMATCH),
-											 errmsg("result rowtype does not match expected rowtype connection: %s query: %s",
-													cur_worker->connstr, cur_worker->current_query)));
+									append_binary_result_set(result,cur_worker,outrs_tupdesc,
+																binary_values, binary_nulls,
+																binary_typioparams, binary_fmgrinfo,
+																outrs_attinmeta,outrs_tupstore);
 								}
-
-								if (ntuples > 0)
+								else
 								{
-									if (PQbinaryTuples(result))
-									{
-										append_binary_result_set(result,cur_worker,outrs_tupdesc,
-																	binary_values, binary_nulls,
-																	binary_typioparams, binary_fmgrinfo,
-																	outrs_attinmeta,outrs_tupstore);
-									}
-									else
-									{
-										append_text_result_set(result,cur_worker,outrs_attinmeta,outrs_tupstore);
-									}
+									append_text_result_set(result,cur_worker,outrs_attinmeta,outrs_tupstore);
 								}
 							}
-							else if (PQresultStatus(result) == PGRES_COMMAND_OK)
-							{
-								/* Non-query commands only return one row (query,status) */
-								ErrorContextCallback errcallback;
-								char	  **command_values = (char **) palloc(2 * sizeof(char *));
-								HeapTuple	tuple;
-
-								errcallback.callback = worker_error_callback;
-								errcallback.arg = (void *) cur_worker;
-								errcallback.previous = error_context_stack;
-								error_context_stack = &errcallback;
-
-								command_values[0] = cur_worker->current_query;
-								command_values[1] = PQcmdStatus(result);
-								tuple = BuildTupleFromCStrings(outrs_attinmeta, command_values);
-								error_context_stack = errcallback.previous;
-								tuplestore_puttuple(outrs_tupstore, tuple);
-							}
-							else
-							{
-								ereport(WARNING,
-										(errmsg("PQresultstatus is %d binary mode is %d",
-												PQresultStatus(result),BINARY_MODE)));
-								res_error(result,cur_worker->connstr,cur_worker->current_query,true);
-							}
-							PQclear(result);
 						}
-					
-						/*
-						fetching this result set took time, so we don't have to sleep before asking
-						other connections if they are done
-						*/
-						got_a_result = true;
-						if (m->next_query < m->num_queries)
+						else if (PQresultStatus(result) == PGRES_COMMAND_OK)
 						{
-							cur_worker->current_query = m->queries[m->next_query];
-							send_async_query(cur_worker);
-							m->next_query++;
-							connection_active = true;
+							/* Non-query commands only return one row (query,status) */
+							ErrorContextCallback errcallback;
+							char	  **command_values = (char **) palloc(2 * sizeof(char *));
+							HeapTuple	tuple;
+
+							errcallback.callback = worker_error_callback;
+							errcallback.arg = (void *) cur_worker;
+							errcallback.previous = error_context_stack;
+							error_context_stack = &errcallback;
+
+							command_values[0] = cur_worker->current_query;
+							command_values[1] = PQcmdStatus(result);
+							tuple = BuildTupleFromCStrings(outrs_attinmeta, command_values);
+							error_context_stack = errcallback.previous;
+							tuplestore_puttuple(outrs_tupstore, tuple);
 						}
 						else
 						{
-							/* close connection and mark the worker as done */
-							PQfinish(cur_worker->connection);
-							cur_worker->connection = NULL;
-							total_number_of_workers--;
+							ereport(WARNING,
+									(errmsg("PQresultstatus is %d binary mode is %d",
+											PQresultStatus(result),BINARY_MODE)));
+							res_error(result,cur_worker->connstr,cur_worker->current_query,true);
 						}
-
-						connection_active = true;
+						PQclear(result);
+					}
+				
+					/*
+					fetching this result set took time, so we don't have to sleep before asking
+					other connections if they are done
+					*/
+					got_a_result = true;
+					if (m->next_query < m->num_queries)
+					{
+						cur_worker->current_query = m->queries[m->next_query];
+						send_async_query(cur_worker);
+						m->next_query++;
+					}
+					else
+					{
+						/* close connection and mark the worker as done */
+						PQfinish(cur_worker->connection);
+						cur_worker->connection = NULL;
+						total_number_of_workers--;
 					}
 				}
 			}
 
-			if (!connection_active)
-			{
-				/* no more connections are active, time to wrap up */
-				break;
-			}
-
-			if (!got_a_result)
+			if (!got_a_result && (total_number_of_workers > 0))
 			{
 				/* sleep just enough to give up the timeslice, no sense monopolizing a CPU */
 				CHECK_FOR_INTERRUPTS();
