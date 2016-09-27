@@ -868,7 +868,7 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 					/* skip connections that we've closed */
 					if (cur_worker->connection == NULL)
 					{
-						continue
+						continue;
 					}
 
 					if (!PQconsumeInput(cur_worker->connection))
