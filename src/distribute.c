@@ -591,7 +591,15 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 					/* skip connections that we've closed */
 					if (cur_worker->connection != NULL)
 					{
-						PQconsumeInput(cur_worker->connection);
+						if (PQconsumeInput(cur_worker->connection) == 0)
+						{
+							ereport(ERROR,
+									(errmsg("error %s polling query: %s on connection %s",
+											PQerrorMessage(cur_worker->connection),
+															cur_worker->current_query,
+															cur_worker->connstr)));
+						}
+
 						if ((total_number_of_workers > 1) && (PQisBusy(cur_worker->connection) == 1))
 						{
 							/* connection is busy and there is more than one connection to wait on */
