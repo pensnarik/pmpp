@@ -18,12 +18,7 @@ select  item->>'connection' as connection,
         item->>'result_format' as result_format;
 $$;
 
-drop function distribute( row_type anyelement,
-                            connection text,
-                            sql_list text[],
-                            cpu_multiplier float default null, 
-                            num_workers integer default null,
-                            setup_commands text[] default null);
+drop function distribute( anyelement, text, text[], float, integer, text[]);
 
 create function distribute( row_type anyelement,
                             connection text,
@@ -45,11 +40,7 @@ is E'Given an array of sql commands, execute each one against an async connecito
     'returning a set of data specified by the row type.\n'
     'This simpler form is geared towards basic parallelism rather than distributed queries';
 
-drop function meta(   connection text,
-                        sql_list text[],
-                        cpu_multiplier float default null,
-                        num_workers integer default null,
-                        setup_commands text[] default null);
+drop function meta( text, text[], float, integer, text[]);
 
 create function meta(   connection text,
                         sql_list text[],
