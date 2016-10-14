@@ -95,3 +95,57 @@ is E'Execute a single SQL query across a list of connections\n'
     '                    array( select srvname from pg_foreign_server ),\n'
     '                    ''selct count(*) from pg_class'' );';
  
+create function to_query_manifest_array(manifest in json) returns query_manifest[]
+language sql strict immutable set search_path from current as $$
+select to_query_manifest_array(manifest::jsonb);
+$$;
+
+comment on function to_query_manifest_array(item in json)
+is  'Convert a JSON manifest item array to a query_manifest[]';
+
+create cast (json as query_manifest[]) with function to_query_manifest_array(json) as implicit;
+
+comment on cast (json as query_manifest[])
+is  'Cast JSON->query_manifest[]';
+
+create function distribute( query_manifest query_manifest[] ) returns setof record
+as 'MODULE_PATHNAME','pmpp_distribute'
+language c;
+
+comment on function distribute(query_manifest[])
+is E'For each query manifest object in the array:\n'
+    'Connect to each of the databases with a number of connections equal to num_workers (if specified), or \n'
+    'the number of cpus found on the machine at the end of that connection times the mulitplier (defaults to 1.0).\n'
+    'Each query specified must return a result set matching the row specification.\n'
+    'The queries are distributed to the connections as they become available, and the results of those queries are\n'
+    'in turn pushed to the result set, where they can be further manipulated like any table, view, or set returning function.\n'
+    'Returns a result set in the shape of row_type.';
+
+create function distribute( query_manifest jsonb ) returns setof record
+as 'MODULE_PATHNAME','pmpp_distribute'
+language c;
+
+comment on function distribute(jsonb)
+is E'Alternate version of distribute that takes a jsonb document instead of an array of query_manifest.\n'
+    'The JSON document must be an array of objects in the the following structure:\n'
+    '\t [{"connection": "connection-string", "queries": ["query 1","query 2", ...], "num_workers": 4},\n'
+    '\t  {"connection": "connection-string", "queries": ["query 10", "query 11", ...], "multiplier": 1.5},\n'
+    '\t [{"connection": "connection-string", "query": "query sql"},\n'
+    '\t  ...]\n'
+    'Other elements within the objects would be ignored.';
+
+create function distribute( query_manifest in json ) returns setof record
+as 'MODULE_PATHNAME','pmpp_distribute'
+language c;
+
+comment on function distribute(json)
+is E'Pass-through function so that we can accept json as well as jsonb';
+
+create or replace function distribute( row_type anyelement, query_manifest jsonb ) returns setof anyelement
+as 'MODULE_PATHNAME','pmpp_distribute' language c;
+
+create or replace function distribute( row_type anyelement, query_manifest json ) returns setof anyelement
+as 'MODULE_PATHNAME','pmpp_distribute' language c;
+
+grant usage on schema @extschema@ to pmpp;
+grant execute on all functions in schema @extschema@ to pmpp;

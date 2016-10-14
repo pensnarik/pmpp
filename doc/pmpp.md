@@ -258,8 +258,36 @@ ORDER by x;
 (1 row)
 ```
 
+### distribute() - SETOF RECORD versions
+
+```sql
+function distribute( p_query_manifest query_manifest[] ) returns setof record
+function distribute( p_query_manifest jsonb ) returns setof record
+function distribute( p_query_manifest json ) returns setof record
+```
+
+These functions behave identically to their polymorphic namesakes, except that the result set shape is defined in the query, not by an object.
+
+These variants come in handy when the result sets do not match an existing local database object, and it is not desirable (or possible in the case of a read-replica) to create model objects.
 
 
+```
+SELECT * 
+FROM pmpp.distribute(
+        '[{"connection": "foreign_server_without_pmpp", "queries": ["SELECT 1,2","SELECT 3,4"], "num_workers": 4},'
+        ' {"connection": "named_foreign_server", "queries": ["SELECT 5,6", "SELECT 7,8"], "multiplier": 1.5},'
+        ' {"connection": "postgresql://user:secret@localhost", "query": "SELECT 9,10"}]'::jsonb
+        ) AS xy(x integer, y integer)
+ORDER by x;
+ x | y
+---+----
+ 1 |  2
+ 3 |  4
+ 5 |  6
+ 7 |  8
+ 9 | 10
+(1 row)
+```
 
 
 ### meta()
@@ -395,7 +423,7 @@ Extracts an array of `query_manifest` records from a `jsonb` object.
 
 ## Under The Hood.
 
-Parallel querying is accomplished through usage of the async libpq functions, and some supporting code borrowed from the [dblink](http://www.postgresql.org/docs/current/static/dblink.html) extension. Queue management is handled through internal data structures, and no longer uses temp tables.
+Parallel querying is accomplished through usage of the async libpq functions, and some supporting code borrowed from the [dblink](http://www.postgresql.org/docs/current/static/dblink.html) extensi, though that extension is not required. Queue management is handled through internal data structures, and no longer uses temp tables.
 
 ### Support
 

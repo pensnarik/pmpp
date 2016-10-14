@@ -3,6 +3,7 @@
 #include "funcapi.h"
 #include "miscadmin.h" /* for work_mem */
 #include "access/htup_details.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_user_mapping.h"
 #include "executor/executor.h"
@@ -13,28 +14,30 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/syscache.h"
 #include "utils/palloc.h"
 #include "utils/typcache.h"
 #include "libpq-fe.h"
 #include "parser/parse_coerce.h"
 #include <math.h>
 
-
-#define QUERY_MANIFEST_CONNECTION_ATTR_INDEX 0
-#define QUERY_MANIFEST_QUERIES_ATTR_INDEX 1
-#define QUERY_MANIFEST_CPU_MULTIPLIER_ATTR_INDEX 2
-#define QUERY_MANIFEST_NUM_WORKERS_ATTR_INDEX 3
-#define QUERY_MANIFEST_SETUP_COMMANDS_ATTR_INDEX 4
-#define QUERY_MANIFEST_RESULT_FORMAT_ATTR_INDEX 4
+#ifdef PG_MODULE_MAGIC
+PG_MODULE_MAGIC;
+#endif
 
 #define ARRAY_OK 0
 #define ARRAY_CONTAINS_NULLS 1
 
 #define BINARY_MODE 0
 
-#ifdef PG_MODULE_MAGIC
-PG_MODULE_MAGIC;
-#endif
+typedef enum {
+	QUERY_MANIFEST_CONNECTION_ATTR_INDEX = 0,
+	QUERY_MANIFEST_QUERIES_ATTR_INDEX,
+	QUERY_MANIFEST_CPU_MULTIPLIER_ATTR_INDEX,
+	QUERY_MANIFEST_NUM_WORKERS_ATTR_INDEX,
+	QUERY_MANIFEST_SETUP_COMMANDS_ATTR_INDEX,
+	QUERY_MANIFEST_RESULT_FORMAT_ATTR_INDEX
+} query_manifest_attribute_indexes;
 
 typedef enum {
 	RESULT_FORMAT_ORIGINAL = 0,
@@ -581,6 +584,52 @@ void append_binary_result_set(	const PGresult	*result,
 
 
 /*
+ * Figure out which parameter is the query manifest/json/jsonb
+ * Do type conversions as necessary
+ */
+static
+ArrayType* get_query_manifest_array_param(FunctionCallInfo fcinfo)
+{
+	int	argnum = (PG_NARGS() == 2) ? 1 : 0;
+	Oid	arg_type_oid = get_fn_expr_argtype(fcinfo->flinfo,argnum);
+	Oid pmpp_namespace_oid = get_namespace_oid("pmpp",false);
+	Oid	manifest_array_type_oid = GetSysCacheOid2(TYPENAMENSP,
+													 PointerGetDatum("_query_manifest"),
+													 ObjectIdGetDatum(pmpp_namespace_oid));
+	Datum d = PG_GETARG_DATUM(argnum);
+
+	if (arg_type_oid != manifest_array_type_oid)
+	{
+		/*
+	     * arg wasn't a query_manifest[]. Try to coerce it into one.
+		 * Currently this should only work for JSON and JSONB types.
+		 */
+		Oid coercion_fn_oid;
+		CoercionPathType pathtype = find_coercion_pathway(	manifest_array_type_oid,
+															arg_type_oid,
+															COERCION_ASSIGNMENT,
+															&coercion_fn_oid);
+		if (pathtype == COERCION_PATH_FUNC)
+		{
+			FmgrInfo finfo;
+			fmgr_info(coercion_fn_oid, &finfo);
+			d = FunctionCall1(&finfo,d);
+		}
+		else
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("input value has type %s which cannot be coerced into expected type %s.",
+								format_type_be(arg_type_oid),
+								format_type_be(manifest_array_type_oid))));
+		}
+	}
+
+	return DatumGetArrayTypePCopy(d);
+}
+
+
+/*
  * distribute
  */
 PG_FUNCTION_INFO_V1(pmpp_distribute);
@@ -596,11 +645,14 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 	MemoryContext	oldcontext;
 
 	/*
-	 * 1st Arg is row_type, it is needed only for polymorphism, so we can ignore that
-	 * 2nd Arg is the query_manifest, and must be of type query_manifest_t
+     * in polymorphic context:
+	 *   1st Arg is row_type, it is needed only for polymorphism, so we can ignore that
+	 *   2nd Arg is the query_manifest, and must be of type query_manifest_t
+     * in returns setof record context: 
+	 *   Only Arg is the query_manifest, can type query_manifest_t, json, or jsonb
 	 */
 
-	ArrayType	*query_manifest_t_param = PG_GETARG_ARRAYTYPE_P(1);
+	ArrayType	*query_manifest_t_param = get_query_manifest_array_param(fcinfo);
 	Oid			query_manifest_t_param_oid = ARR_ELEMTYPE(query_manifest_t_param);
 	int16		query_manifest_t_param_element_length;
 	bool		query_manifest_t_param_element_pass_by_value;
@@ -656,7 +708,7 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 				 errmsg("materialize mode required, but it is not allowed in this context")));
 	}
 
-	if (PG_NARGS() != 2)
+	if (PG_NARGS() > 2)
 	{
 		ereport(ERROR,
 						(errcode(ERRCODE_TOO_MANY_ARGUMENTS),
@@ -789,7 +841,9 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 				{
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("result_format, if specified, must be one of: binary text")));
+							 errmsg("result_format [%s/%d], if specified, must be one of: binary text",s,
+query_manifest_t_tupdesc->natts
+)));
 				}
 			}
 
@@ -938,9 +992,11 @@ pmpp_distribute(PG_FUNCTION_ARGS)
 						}
 						else
 						{
+							/*
 							ereport(WARNING,
 									(errmsg("PQresultstatus is %d binary mode is %d",
 											PQresultStatus(result),BINARY_MODE)));
+							*/
 							res_error(result,cur_worker->connstr,cur_worker->current_query,true);
 						}
 						PQclear(result);
