@@ -25,7 +25,10 @@ select  format('[{"connection": "%s", "query": "select 1"}]',
         format('[{"connection": "%s", "query": "select count(pg_sleep(1))", "statement_timeout": 100}]',
                 :'pmpp_localhost_server') as json_str_timeout,
         format('[{"connection": "%s", "num_workers": 1, "queries": ["select 1","select 2/0","select 3"]}]',
-                :'pmpp_localhost_server') as json_str_div_zero
+                :'pmpp_localhost_server') as json_str_div_zero,
+        format('[{"connection": "%s", "num_workers": 1, "queries": ["select 1","select 2","select 3"],'
+                    ' "result_format": "binary" }]',
+                :'pmpp_localhost_server') as json_str_binary_mode
 \gset 
 
 select pmpp.to_query_manifest('{"connection": "foo"}'::jsonb);
@@ -51,6 +54,12 @@ order by b;
 --
 select  t.*
 from    unnest(:'json_str_1'::jsonb::pmpp.query_manifest[]) t;
+
+--
+-- test binary mode setting
+--
+select  t.*
+from    unnest(:'json_str_binary_mode'::jsonb::pmpp.query_manifest[]) t;
 
 create temporary table x(y integer);
 
@@ -146,17 +155,21 @@ from pmpp.broadcast(null::x, array[ :'loopback_su_conn_str' , :'pmpp_localhost_s
 select *
 from    pmpp.distribute(null::x, :'json_str_div_zero'::jsonb);
 
-drop user mapping for public server :pmpp_localhost_server;
-create user mapping for public server :pmpp_localhost_server options(user :'nopw_test_user', password '');
-
-select *
-from    pmpp.distribute(null::x, :'json_str_2'::jsonb);
-
+select  *
+from    pmpp.distribute(null::x, :'json_str_binary_mode'::jsonb);
 
 select *
 from    pmpp.distribute(null::x, '[{"connection": "bad_connstr_1", "query": "select 1"},'
                                  '{"connection": "bad_connstr2", "query": "select 2", '
                                  '  "setup_commands": ["set application_name = test1", "set client_encoding = UTF8" ] }]'::jsonb); 
+
+--
+-- test setof record versions
+--
+select *
+from    pmpp.distribute(:'json_str_2'::jsonb) as ( y integer );
+select *
+from    pmpp.distribute(:'json_str_2'::json) as ( y integer );
 
 drop role :pmpp_test_user;
 drop role :nopw_test_user;
