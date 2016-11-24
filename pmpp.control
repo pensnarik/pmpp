@@ -1,5 +1,5 @@
 # pmpp extension
-default_version = '1.2.0'
+default_version = '1.2.1'
 comment = 'Extension for parallel metaquerying'
 relocatable = false
 schema = pmpp
