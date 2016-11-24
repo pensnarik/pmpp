@@ -7,12 +7,12 @@ TESTS = $(wildcard test/sql/*.sql)
 REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))
 REGRESS_OPTS = --inputdir=test --load-language=plpgsql
 PG_CONFIG = pg_config
-PKG_CONFIG = pkg-config
 MODULES	= $(patsubst %.c,%,$(wildcard src/*.c))
 MODULE_big = $(EXTENSION)
 OBJS = $(patsubst %.c,%.o,$(wildcard src/*.c))
-PG_CPPFLAGS = $(shell $(PKG_CONFIG) --cflags libpq )
-SHLIB_LINK = $(shell $(PKG_CONFIG) --libs libpq)
+#PG_CPPFLAGS= $(shell $(PG_CONFIG) --cflags ) -I $(shell $(PG_CONFIG) --includedir)
+PG_CPPFLAGS= $(shell $(PG_CONFIG) --cflags )
+SHLIB_LINK = $(shell $(PG_CONFIG) --libs )
 
 PG94 = $(shell $(PG_CONFIG) --version | egrep " 8\.| 9\.0| 9\.1| 9\.2| 9\.3" > /dev/null && echo no || echo yes)
 ifeq ($(PG94),no)
