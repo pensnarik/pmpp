@@ -992,11 +992,6 @@ query_manifest_t_tupdesc->natts
 						}
 						else
 						{
-							/*
-							ereport(WARNING,
-									(errmsg("PQresultstatus is %d binary mode is %d",
-											PQresultStatus(result),BINARY_MODE)));
-							*/
 							res_error(result,cur_worker->connstr,cur_worker->current_query,true);
 						}
 						PQclear(result);
@@ -1046,7 +1041,16 @@ query_manifest_t_tupdesc->natts
 
 		for (i = 0, m = &manifest[0]; i < query_manifest_t_num_datums; i++, m++ )
 		{
-			worker		*w;
+			worker	*w;
+
+			/*
+			 * if we never allocated workers to this manifest, then there are no connections 
+			 * to clean up.
+			 * this is the case when the error raised was in making the first connection for a manifest.
+			 */
+			if (m->workers == NULL)
+				continue;
+
 			for (j = 0, w = (worker*) m->workers; j < m->num_workers; j++, w++)
 			{
 				if (w->connection != NULL)
